@@ -6,38 +6,40 @@
 ; ====================================================================================
 
 ; Priority Settings
-useIdlePriority := false       ; true = IDLE, false = BELOW NORMAL
+useIdlePriority := false                    ; Use idle priority class (slowest) instead of below normal
+useBackgroundMode := true                   ; Enable Windows background mode for better foreground responsiveness
 
 ; Memory Management
-useMemoryTrimming := true      ; true = trim working set to reduce RAM usage
-memoryThresholdMB := 10        ; only trim processes using more than this amount of RAM (in MB)
-useAggressiveMemory := true    ; true = use ultra-aggressive memory reduction (working set limits + multi-pass trim)
-memoryTrimPasses := 3          ; number of times to call EmptyWorkingSet (more passes = more aggressive)
+useMemoryTrimming := true                   ; Enable working set memory trimming
+memoryThresholdMB := 10                     ; Only trim memory if process uses more than this many MB
+useAggressiveMemory := true                 ; Use multiple trim passes for better memory reduction
+memoryTrimPasses := 3                       ; Number of trim passes when aggressive mode is enabled
 
-; Advanced CPU Reduction
-useIoPriority := true          ; true = set I/O priority to Very Low (reduces disk/network interference)
-useCpuAffinity := true         ; true = restrict to specific CPU cores (limits CPU access)
-cpuAffinityMask := 0x03        ; bitmask for allowed cores (0x03 = cores 0-1, 0x0F = cores 0-3)
-useCpuRateLimit := true        ; true = hard cap CPU usage percentage (most aggressive)
-cpuRateLimitPercent := 5       ; max CPU usage percent (1-100) when rate limiting enabled
-useBackgroundMode := true      ; true = enable PROCESS_MODE_BACKGROUND_BEGIN (tells Windows process is background)
+; CPU Management
+useCpuAffinity := true                      ; Restrict processes to specific CPU cores
+cpuAffinityMask := 0x03                     ; Bitmask for CPU cores (0x03 = cores 0 and 1)
+useCpuRateLimit := true                     ; Enable CPU usage rate limiting via job objects
+cpuRateLimitPercent := 5                    ; Maximum CPU usage percent per process
 
-; Mode Selection
-useBlacklistMode := true      ; true = target ONLY apps in targetNames list, false = target ALL apps except exceptions
+; I/O Priority
+useIoPriority := true                       ; Lower I/O priority for disk/network operations
 
-; Blacklist Mode - Target specific apps
-targetNames := ["CCleaner_service.exe", "svchost.exe", "WmiPrvSE.exe", "bdservicehost.exe",
-    "downloader.exe", "testinitsigs.exe", "AdobeColabSync.exe"]
+; Mode Settings
+useBlacklistMode := true                    ; true = only target specific processes, false = target all except exceptions
 
-; Whitelist Mode - Skip Rules
-exceptions := ["Flow.Launcher.exe", "explorer.exe", "everything.exe", "yasb.exe"]
-skipWindowsApps := false
-skipForegroundProcess := true
-skipForegroundProcessTree := true
-skipExceptionProcessTree := true
+; Process Lists
+targetNames := ["CCleaner_service.exe", "svchost.exe", "WmiPrvSE.exe", "bdservicehost.exe", "downloader.exe",
+    "testinitsigs.exe", "AdobeColabSync.exe"]  ; Processes to throttle when in blacklist mode
+exceptions := ["Flow.Launcher.exe", "explorer.exe", "everything.exe", "yasb.exe"]  ; Processes to never throttle when in whitelist mode
+
+; Skip Conditions
+skipWindowsApps := false                    ; Skip UWP/Microsoft Store apps
+skipForegroundProcess := true               ; Don't throttle the currently active window's process
+skipForegroundProcessTree := true           ; Don't throttle parent/child processes of foreground app
+skipExceptionProcessTree := true            ; Don't throttle parent/child processes of exception apps
 
 ; ====================================================================================
-; CONSTANTS
+; CONSTANTS & GLOBALS
 ; ====================================================================================
 
 PROCESS_QUERY_LIMITED_INFORMATION := 0x1000
@@ -55,22 +57,16 @@ PROCESS_MEMORY_COUNTERS_SIZE := 72
 PE32_PID_OFFSET := 8
 PE32_PPID_OFFSET_X86 := 20
 PE32_PPID_OFFSET_X64 := 28
-handled := Map()
-currentScriptPID := DllCall("Kernel32\GetCurrentProcessId", "UInt")
-currentForegroundPID := 0
-foregroundHookHandle := 0
-pendingForegroundChange := false
 PBI_PARENT_OFFSET_X86 := 20
 PBI_PARENT_OFFSET_X64 := 40
 SCAN_INTERVAL_MS := 15000
 MAX_PATH_CHARS := 260
 
-; ====================================================================================
-; GLOBAL STATE
-; ====================================================================================
-
-handled := Map(), currentScriptPID := DllCall("Kernel32\GetCurrentProcessId", "UInt")
-currentForegroundPID := 0, foregroundHookHandle := 0, pendingForegroundChange := false
+handled := Map()
+currentScriptPID := DllCall("Kernel32\GetCurrentProcessId", "UInt")
+currentForegroundPID := 0
+foregroundHookHandle := 0
+pendingForegroundChange := false
 
 ; ====================================================================================
 ; INITIALIZATION
@@ -164,23 +160,11 @@ BuildExceptionTreeMap() {
 
 ShouldSkipProcess(pid, foregroundPID, foregroundTreePIDs, exceptionTreePIDs, &skipCounts) {
     global handled, currentScriptPID, useBlacklistMode
-    if (pid = currentScriptPID)
-        return true
-    if (useBlacklistMode && !IsTargetApp(pid))
-        return true
-    if (skipWindowsApps && IsWindowsApp(pid)) {
-        skipCounts.uwp++
-        return true
-    }
-    if (skipForegroundProcess && foregroundPID && pid = foregroundPID) {
-        RestoreIfHandled(pid)
-        return true
-    }
-    if (skipForegroundProcessTree && foregroundTreePIDs.Has(pid)) {
-        RestoreIfHandled(pid)
-        return true
-    }
-    if (!useBlacklistMode) {
+
+    if (useBlacklistMode) {
+        if (!IsTargetApp(pid))
+            return true
+    } else {
         if (IsException(pid)) {
             skipCounts.exception++
             RestoreIfHandled(pid)
@@ -191,6 +175,25 @@ ShouldSkipProcess(pid, foregroundPID, foregroundTreePIDs, exceptionTreePIDs, &sk
             return true
         }
     }
+
+    if (pid = currentScriptPID)
+        return true
+
+    if (skipWindowsApps && IsWindowsApp(pid)) {
+        skipCounts.uwp++
+        return true
+    }
+
+    if (skipForegroundProcess && foregroundPID && pid = foregroundPID) {
+        RestoreIfHandled(pid)
+        return true
+    }
+
+    if (skipForegroundProcessTree && foregroundTreePIDs.Has(pid)) {
+        RestoreIfHandled(pid)
+        return true
+    }
+
     return false
 }
 
@@ -219,10 +222,6 @@ ProcessBackgroundApp(pid) {
         TrimProcessMemory(pid, memoryThresholdMB, useAggressiveMemory, memoryTrimPasses)
 }
 
-; ====================================================================================
-; TRAY TOOLTIP
-; ====================================================================================
-
 UpdateTrayTooltip(uwpCount := 0, exceptionCount := 0) {
     global handled, skipForegroundProcess, skipForegroundProcessTree
     foregroundPID := GetForegroundProcessId()
@@ -234,8 +233,7 @@ UpdateTrayTooltip(uwpCount := 0, exceptionCount := 0) {
     if !foregroundName
         foregroundName := "Unknown"
     throttledCount := handled.Count
-    treeSize := skipForegroundProcessTree ? GetProcessTreePIDs(foregroundPID).Length : (skipForegroundProcess ? 1 :
-        0)
+    treeSize := skipForegroundProcessTree ? GetProcessTreePIDs(foregroundPID).Length : (skipForegroundProcess ? 1 : 0)
     totalSkipped := uwpCount + treeSize + exceptionCount
     tooltip := "Keep ALL Apps Efficient`nMode: " . (useBlacklistMode ? "Blacklist (Target Only)" :
         "Whitelist (All Except)")
@@ -245,10 +243,6 @@ UpdateTrayTooltip(uwpCount := 0, exceptionCount := 0) {
     A_IconTip := tooltip
 }
 
-; ====================================================================================
-; PROCESS WATCHER
-; ====================================================================================
-
 SetupProcessWatcher() {
     query := "SELECT ProcessId FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'"
     sink := ComObject("WbemScripting.SWbemSink")
@@ -257,15 +251,11 @@ SetupProcessWatcher() {
     wmi.ExecNotificationQueryAsync(sink, query)
 }
 
-; ====================================================================================
-; FOREGROUND WINDOW WATCHER
-; ====================================================================================
-
 SetupForegroundWatcher() {
     global foregroundHookHandle, currentForegroundPID
     callback := CallbackCreate(OnForegroundWindowChanged, "F", 7)
-    foregroundHookHandle := DllCall("User32\SetWinEventHook", "UInt", 0x0003, "UInt", 0x0003, "Ptr", 0,
-        "Ptr", callback, "UInt", 0, "UInt", 0, "UInt", 0x0002, "Ptr")
+    foregroundHookHandle := DllCall("User32\SetWinEventHook", "UInt", 0x0003, "UInt", 0x0003, "Ptr", 0, "Ptr", callback,
+        "UInt", 0, "UInt", 0, "UInt", 0x0002, "Ptr")
     currentForegroundPID := GetForegroundProcessId()
 }
 
@@ -303,16 +293,19 @@ ProcessForegroundChange() {
 
 ApplyToProcessList(pidList) {
     global handled, useIdlePriority, useMemoryTrimming, memoryThresholdMB, useAggressiveMemory, memoryTrimPasses,
-        currentScriptPID
+        currentScriptPID, useBlacklistMode
     for _, targetPID in pidList {
-        if (targetPID = currentScriptPID || (skipWindowsApps && IsWindowsApp(targetPID)) || IsException(targetPID))
+        if (targetPID = currentScriptPID || (skipWindowsApps && IsWindowsApp(targetPID)))
+            continue
+        if (useBlacklistMode && !IsTargetApp(targetPID))
+            continue
+        if (!useBlacklistMode && IsException(targetPID))
             continue
         if !handled.Has(targetPID) {
             originalPriority := GetProcessPriority(targetPID)
             result := ApplyEfficiencyLikeMode(targetPID, useIdlePriority)
             if (originalPriority && result.success) {
-                memTrimmed := useMemoryTrimming ? TrimProcessMemory(targetPID, memoryThresholdMB,
-                    useAggressiveMemory,
+                memTrimmed := useMemoryTrimming ? TrimProcessMemory(targetPID, memoryThresholdMB, useAggressiveMemory,
                     memoryTrimPasses) : false
                 handled[targetPID] := { priority: originalPriority, throttled: true, memoryTrimmed: memTrimmed,
                     jobHandle: result.jobHandle, originalAffinity: result.originalAffinity }
@@ -327,12 +320,16 @@ RestoreProcessList(pidList) {
 }
 
 OnProcessCreated_OnObjectReady(objWbemObject, objWbemAsyncContext) {
-    global currentScriptPID, skipWindowsApps, skipForegroundProcess, handled, useIdlePriority
+    global currentScriptPID, skipWindowsApps, skipForegroundProcess, handled, useIdlePriority, useBlacklistMode
     global useMemoryTrimming, memoryThresholdMB, useAggressiveMemory, memoryTrimPasses
     try {
         pid := objWbemObject.TargetInstance.ProcessId
-        if (pid = currentScriptPID || (skipWindowsApps && IsWindowsApp(pid)) ||
-        (skipForegroundProcess && pid = GetForegroundProcessId()) || IsException(pid) || handled.Has(pid))
+        if (pid = currentScriptPID || (skipWindowsApps && IsWindowsApp(pid)) || (skipForegroundProcess && pid =
+            GetForegroundProcessId()) || handled.Has(pid))
+            return
+        if (useBlacklistMode && !IsTargetApp(pid))
+            return
+        if (!useBlacklistMode && IsException(pid))
             return
         originalPriority := GetProcessPriority(pid)
         if !originalPriority
@@ -345,15 +342,11 @@ OnProcessCreated_OnObjectReady(objWbemObject, objWbemAsyncContext) {
         if result.success {
             memTrimmed := useMemoryTrimming ? TrimProcessMemory(pid, memoryThresholdMB, useAggressiveMemory,
                 memoryTrimPasses) : false
-            handled[pid] := { priority: originalPriority, throttled: true, memoryTrimmed: memTrimmed,
-                jobHandle: result.jobHandle, originalAffinity: result.originalAffinity }
+            handled[pid] := { priority: originalPriority, throttled: true, memoryTrimmed: memTrimmed, jobHandle: result
+                .jobHandle, originalAffinity: result.originalAffinity }
         }
     }
 }
-
-; ====================================================================================
-; PROCESS IDENTIFICATION
-; ====================================================================================
 
 IsWindowsApp(pid) {
     hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_QUERY_LIMITED_INFORMATION, "Int", false, "UInt", pid,
@@ -362,8 +355,7 @@ IsWindowsApp(pid) {
         return false
     try {
         packageLength := 0
-        nameBuffer := Buffer(MAX_PATH_CHARS * 2, 0)
-        nameSize := MAX_PATH_CHARS
+        result := DllCall("Kernel32\GetPackageFullName", "Ptr", hProc, "UInt*", &packageLength, "Ptr", 0, "Int")
         return (result = 122)
     } finally {
         DllCall("Kernel32\CloseHandle", "Ptr", hProc)
@@ -376,7 +368,8 @@ GetProcessName(pid) {
     if !hProc
         return ""
     try {
-        nameBuffer := Buffer(MAX_PATH_CHARS * 2, 0), nameSize := MAX_PATH_CHARS
+        nameBuffer := Buffer(MAX_PATH_CHARS * 2, 0)
+        nameSize := MAX_PATH_CHARS
         if DllCall("Kernel32\QueryFullProcessImageName", "Ptr", hProc, "UInt", 0, "Ptr", nameBuffer.Ptr, "UInt*", &
             nameSize) {
             fullPath := StrGet(nameBuffer.Ptr, "UTF-16")
@@ -404,7 +397,8 @@ GetParentProcessId(pid) {
     if !hProc
         return 0
     try {
-        pbi := Buffer(PROCESS_BASIC_INFO_SIZE, 0), returnLength := 0
+        pbi := Buffer(PROCESS_BASIC_INFO_SIZE, 0)
+        returnLength := 0
         result := DllCall("Ntdll\NtQueryInformationProcess", "Ptr", hProc, "Int", 0, "Ptr", pbi.Ptr, "UInt", pbi.Size,
             "UInt*", &returnLength)
         if (result = 0) {
@@ -453,12 +447,9 @@ GetProcessPriority(pid) {
     }
 }
 
-; ====================================================================================
-; PROCESS TREE ANALYSIS
-; ====================================================================================
-
 GetProcessTreePIDs(rootPid) {
-    treePIDs := [rootPid], rootName := GetProcessName(rootPid)
+    treePIDs := [rootPid]
+    rootName := GetProcessName(rootPid)
     parentPID := GetParentProcessId(rootPid)
     if (parentPID && parentPID != rootPid) {
         hParent := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_QUERY_LIMITED_INFORMATION, "Int", false, "UInt",
@@ -511,10 +502,6 @@ ArrayHas(arr, value) {
     return false
 }
 
-; ====================================================================================
-; PROCESS RESTORATION
-; ====================================================================================
-
 RestoreAllProcesses(*) {
     global handled, foregroundHookHandle
     if foregroundHookHandle {
@@ -522,8 +509,8 @@ RestoreAllProcesses(*) {
         foregroundHookHandle := 0
     }
     for pid, info in handled {
-        RestoreProcess(pid, info.priority, info.HasOwnProp("jobHandle") ? info.jobHandle : 0,
-        info.HasOwnProp("originalAffinity") ? info.originalAffinity : 0)
+        RestoreProcess(pid, info.priority, info.HasOwnProp("jobHandle") ? info.jobHandle : 0, info.HasOwnProp(
+            "originalAffinity") ? info.originalAffinity : 0)
     }
 }
 
@@ -554,10 +541,6 @@ RestoreProcess(pid, originalPriority, jobHandle := 0, originalAffinity := 0) {
         DllCall("Kernel32\CloseHandle", "Ptr", hProc)
     }
 }
-
-; ====================================================================================
-; MEMORY MANAGEMENT
-; ====================================================================================
 
 GetProcessMemoryMB(pid) {
     access := PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ
@@ -602,10 +585,6 @@ TrimProcessMemory(pid, thresholdMB := 100, aggressive := true, passes := 3) {
         DllCall("Kernel32\CloseHandle", "Ptr", hProc)
     }
 }
-
-; ====================================================================================
-; EFFICIENCY MODE APPLICATION
-; ====================================================================================
 
 ApplyEfficiencyLikeMode(pid, idlePriority := false) {
     global useIoPriority, useCpuAffinity, cpuAffinityMask, useCpuRateLimit, cpuRateLimitPercent, useBackgroundMode
