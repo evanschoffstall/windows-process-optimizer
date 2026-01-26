@@ -67,7 +67,7 @@ global CONFIG := {
             cpuRateLimitPercent: 1,
             useIoPriority: true,
             useSuspendCycles: true,
-            suspendDurationMs: 200,
+            suspendDurationMs: 2000,
             resumeDurationMs: 20,
             usePagePriority: true,
             pagePriority: 1,
@@ -155,12 +155,15 @@ MAX_PATH_CHARS := 260
 
 handled := Map()
 suspendCycleTimers := Map()
+cpuRateLimitTimers := Map()
+cpuUsageTracking := Map()
 currentScriptPID := DllCall("Kernel32\GetCurrentProcessId", "UInt")
 currentForegroundPID := 0
 foregroundHookHandle := 0
 pendingForegroundChange := false
 
 PROCESS_SUSPEND_RESUME := 0x0800
+CPU_RATE_CHECK_INTERVAL := 100  ; Check CPU usage every 100ms
 
 ; ====================================================================================
 ; INITIALIZATION
@@ -295,8 +298,7 @@ RestoreIfHandled(pid) {
     global handled
     if handled.Has(pid) {
         info := handled[pid]
-        RestoreProcess(pid, info.priority, info.HasOwnProp("jobHandle") ? info.jobHandle : 0, info.HasOwnProp(
-            "originalAffinity") ? info.originalAffinity : 0)
+        RestoreProcess(pid, info.priority, info.HasOwnProp("originalAffinity") ? info.originalAffinity : 0)
         handled.Delete(pid)
     }
 }
@@ -315,8 +317,8 @@ ProcessBackgroundApp(pid) {
         if (originalPriority && result.success) {
             memTrimmed := settings["useMemoryTrimming"] ? TrimProcessMemory(pid, settings["memoryThresholdMB"],
                 settings["useAggressiveMemory"], settings["memoryTrimPasses"]) : false
-            handled[pid] := { priority: originalPriority, throttled: true, memoryTrimmed: memTrimmed, jobHandle: result
-                .jobHandle, originalAffinity: result.originalAffinity, processName: processName }
+            handled[pid] := { priority: originalPriority, throttled: true, memoryTrimmed: memTrimmed,
+                originalAffinity: result.originalAffinity, processName: processName }
         }
     } else if handled.Has(pid) {
         info := handled[pid]
@@ -420,7 +422,7 @@ ApplyToProcessList(pidList) {
                     ],
                     settings["useAggressiveMemory"], settings["memoryTrimPasses"]) : false
                 handled[targetPID] := { priority: originalPriority, throttled: true, memoryTrimmed: memTrimmed,
-                    jobHandle: result.jobHandle, originalAffinity: result.originalAffinity, processName: processName }
+                    originalAffinity: result.originalAffinity, processName: processName }
             }
         }
     }
@@ -462,8 +464,8 @@ OnProcessCreated_OnObjectReady(objWbemObject, objWbemAsyncContext) {
         if result.success {
             memTrimmed := settings["useMemoryTrimming"] ? TrimProcessMemory(pid, settings["memoryThresholdMB"],
                 settings["useAggressiveMemory"], settings["memoryTrimPasses"]) : false
-            handled[pid] := { priority: originalPriority, throttled: true, memoryTrimmed: memTrimmed, jobHandle: result
-                .jobHandle, originalAffinity: result.originalAffinity, processName: processName }
+            handled[pid] := { priority: originalPriority, throttled: true, memoryTrimmed: memTrimmed,
+                originalAffinity: result.originalAffinity, processName: processName }
         }
     }
 }
@@ -641,16 +643,16 @@ RestoreAllProcesses(*) {
         foregroundHookHandle := 0
     }
     for pid, info in handled {
-        RestoreProcess(pid, info.priority, info.HasOwnProp("jobHandle") ? info.jobHandle : 0, info.HasOwnProp(
-            "originalAffinity") ? info.originalAffinity : 0)
+        RestoreProcess(pid, info.priority, info.HasOwnProp("originalAffinity") ? info.originalAffinity : 0)
     }
 }
 
-RestoreProcess(pid, originalPriority, jobHandle := 0, originalAffinity := 0) {
+RestoreProcess(pid, originalPriority, originalAffinity := 0) {
     global handled, CONFIG
 
-    ; Stop suspend cycle first if active
+    ; Stop suspend cycle and CPU rate limiter if active
     StopSuspendCycle(pid)
+    StopCpuRateLimiter(pid)
 
     access := PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA
     hProc := DllCall("Kernel32\OpenProcess", "UInt", access, "Int", false, "UInt", pid, "Ptr")
@@ -685,8 +687,6 @@ RestoreProcess(pid, originalPriority, jobHandle := 0, originalAffinity := 0) {
         ; Remove working set limits
         if settings["useWorkingSetLimit"]
             DllCall("Kernel32\SetProcessWorkingSetSizeEx", "Ptr", hProc, "Ptr", -1, "Ptr", -1, "UInt", 0)
-        if (settings["useCpuRateLimit"] && jobHandle)
-            DllCall("Kernel32\CloseHandle", "Ptr", jobHandle)
         return true
     } finally {
         DllCall("Kernel32\CloseHandle", "Ptr", hProc)
@@ -743,8 +743,8 @@ ApplyEfficiencyLikeMode(pid, settings) {
         PROCESS_SET_QUOTA
     hProc := DllCall("Kernel32\OpenProcess", "UInt", access, "Int", false, "UInt", pid, "Ptr")
     if !hProc
-        return { success: false, jobHandle: 0, originalAffinity: 0 }
-    jobHandle := 0, originalAffinity := 0
+        return { success: false, originalAffinity: 0 }
+    originalAffinity := 0
     try {
         if settings["useBackgroundMode"]
             DllCall("Kernel32\SetPriorityClass", "Ptr", hProc, "UInt", PROCESS_MODE_BACKGROUND_BEGIN)
@@ -790,16 +790,9 @@ ApplyEfficiencyLikeMode(pid, settings) {
             maxWS := settings["workingSetLimitMB"] * 1024 * 1024
             DllCall("Kernel32\SetProcessWorkingSetSizeEx", "Ptr", hProc, "Ptr", minWS, "Ptr", maxWS, "UInt", 0x6)  ; QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE
         }
+        ; CPU rate limiting via active monitoring and suspend/resume
         if settings["useCpuRateLimit"] {
-            jobHandle := DllCall("Kernel32\CreateJobObject", "Ptr", 0, "Ptr", 0, "Ptr")
-            if jobHandle {
-                DllCall("Kernel32\AssignProcessToJobObject", "Ptr", jobHandle, "Ptr", hProc)
-                cpuRateInfo := Buffer(16, 0)
-                NumPut("UInt", 0x5, cpuRateInfo, 0), NumPut("UInt", settings["cpuRateLimitPercent"] * 100, cpuRateInfo,
-                    4)
-                DllCall("Kernel32\SetInformationJobObject", "Ptr", jobHandle, "Int", 15, "Ptr", cpuRateInfo.Ptr, "UInt",
-                    cpuRateInfo.Size)
-            }
+            StartCpuRateLimiter(pid, settings["cpuRateLimitPercent"])
         }
         ; Suspend cycles - start timer for this PID
         if settings["useSuspendCycles"] {
@@ -810,7 +803,7 @@ ApplyEfficiencyLikeMode(pid, settings) {
             SetTimer(boundFunc, cycleInterval)
             suspendCycleTimers[pid] := boundFunc
         }
-        return { success: !!ok, jobHandle: jobHandle, originalAffinity: originalAffinity }
+        return { success: !!ok, originalAffinity: originalAffinity }
     } finally {
         DllCall("Kernel32\CloseHandle", "Ptr", hProc)
     }
@@ -849,5 +842,182 @@ StopSuspendCycle(pid) {
         suspendCycleTimers.Delete(pid)
         ; Ensure process is resumed
         ResumeProcessCallback(pid)
+    }
+}
+
+; ====================================================================================
+; CPU RATE LIMITER (Active monitoring with suspend/resume)
+; ====================================================================================
+
+StartCpuRateLimiter(pid, targetPercent) {
+    global cpuRateLimitTimers, cpuUsageTracking, CPU_RATE_CHECK_INTERVAL
+
+    ; Initialize tracking for this process
+    cpuUsageTracking[pid] := {
+        targetPercent: targetPercent,
+        lastKernelTime: 0,
+        lastUserTime: 0,
+        lastCheckTime: A_TickCount,
+        isSuspended: false,
+        suspendUntil: 0
+    }
+
+    ; Get initial CPU times
+    UpdateProcessCpuTimes(pid)
+
+    ; Start the monitoring timer
+    boundFunc := CpuRateLimitCallback.Bind(pid)
+    SetTimer(boundFunc, CPU_RATE_CHECK_INTERVAL)
+    cpuRateLimitTimers[pid] := boundFunc
+}
+
+StopCpuRateLimiter(pid) {
+    global cpuRateLimitTimers, cpuUsageTracking, PROCESS_SUSPEND_RESUME
+
+    if cpuRateLimitTimers.Has(pid) {
+        SetTimer(cpuRateLimitTimers[pid], 0)
+        cpuRateLimitTimers.Delete(pid)
+    }
+
+    if cpuUsageTracking.Has(pid) {
+        ; Ensure process is resumed if it was suspended
+        if cpuUsageTracking[pid].isSuspended {
+            hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_SUSPEND_RESUME, "Int", false, "UInt", pid, "Ptr")
+            if hProc {
+                DllCall("Ntdll\NtResumeProcess", "Ptr", hProc)
+                DllCall("Kernel32\CloseHandle", "Ptr", hProc)
+            }
+        }
+        cpuUsageTracking.Delete(pid)
+    }
+}
+
+UpdateProcessCpuTimes(pid) {
+    global cpuUsageTracking, PROCESS_QUERY_LIMITED_INFORMATION
+
+    if !cpuUsageTracking.Has(pid)
+        return false
+
+    hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_QUERY_LIMITED_INFORMATION, "Int", false, "UInt", pid, "Ptr")
+    if !hProc
+        return false
+
+    try {
+        creationTime := Buffer(8, 0)
+        exitTime := Buffer(8, 0)
+        kernelTime := Buffer(8, 0)
+        userTime := Buffer(8, 0)
+
+        if DllCall("Kernel32\GetProcessTimes", "Ptr", hProc, "Ptr", creationTime.Ptr, "Ptr", exitTime.Ptr, "Ptr", kernelTime.Ptr, "Ptr", userTime.Ptr, "Int") {
+            cpuUsageTracking[pid].lastKernelTime := NumGet(kernelTime, 0, "Int64")
+            cpuUsageTracking[pid].lastUserTime := NumGet(userTime, 0, "Int64")
+            cpuUsageTracking[pid].lastCheckTime := A_TickCount
+            return true
+        }
+    } finally {
+        DllCall("Kernel32\CloseHandle", "Ptr", hProc)
+    }
+    return false
+}
+
+GetProcessCpuPercent(pid) {
+    global cpuUsageTracking, PROCESS_QUERY_LIMITED_INFORMATION
+
+    if !cpuUsageTracking.Has(pid)
+        return 0
+
+    tracking := cpuUsageTracking[pid]
+    prevKernel := tracking.lastKernelTime
+    prevUser := tracking.lastUserTime
+    prevTime := tracking.lastCheckTime
+
+    hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_QUERY_LIMITED_INFORMATION, "Int", false, "UInt", pid, "Ptr")
+    if !hProc
+        return 0
+
+    try {
+        creationTime := Buffer(8, 0)
+        exitTime := Buffer(8, 0)
+        kernelTime := Buffer(8, 0)
+        userTime := Buffer(8, 0)
+
+        if DllCall("Kernel32\GetProcessTimes", "Ptr", hProc, "Ptr", creationTime.Ptr, "Ptr", exitTime.Ptr, "Ptr", kernelTime.Ptr, "Ptr", userTime.Ptr, "Int") {
+            currentKernel := NumGet(kernelTime, 0, "Int64")
+            currentUser := NumGet(userTime, 0, "Int64")
+            currentTime := A_TickCount
+
+            ; Update stored values
+            cpuUsageTracking[pid].lastKernelTime := currentKernel
+            cpuUsageTracking[pid].lastUserTime := currentUser
+            cpuUsageTracking[pid].lastCheckTime := currentTime
+
+            ; Calculate CPU usage (times are in 100-nanosecond intervals)
+            elapsedMs := currentTime - prevTime
+            if elapsedMs <= 0
+                return 0
+
+            cpuTimeDelta := (currentKernel - prevKernel) + (currentUser - prevUser)
+            cpuTimeMs := cpuTimeDelta / 10000  ; Convert 100ns to ms
+
+            ; Get number of processors for accurate percentage
+            numProcessors := DllCall("Kernel32\GetActiveProcessorCount", "UShort", 0xFFFF, "UInt")
+            if numProcessors < 1
+                numProcessors := 1
+
+            ; Calculate percentage (CPU time / wall time / num processors * 100)
+            cpuPercent := (cpuTimeMs / elapsedMs / numProcessors) * 100
+            return cpuPercent
+        }
+    } finally {
+        DllCall("Kernel32\CloseHandle", "Ptr", hProc)
+    }
+    return 0
+}
+
+CpuRateLimitCallback(pid) {
+    global cpuUsageTracking, handled, PROCESS_SUSPEND_RESUME
+
+    ; Check if process is still being handled
+    if !handled.Has(pid) || !cpuUsageTracking.Has(pid) {
+        StopCpuRateLimiter(pid)
+        return
+    }
+
+    tracking := cpuUsageTracking[pid]
+
+    ; If process is suspended and waiting, check if it's time to resume
+    if tracking.isSuspended {
+        if A_TickCount >= tracking.suspendUntil {
+            ; Resume the process
+            hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_SUSPEND_RESUME, "Int", false, "UInt", pid, "Ptr")
+            if hProc {
+                DllCall("Ntdll\NtResumeProcess", "Ptr", hProc)
+                DllCall("Kernel32\CloseHandle", "Ptr", hProc)
+            }
+            cpuUsageTracking[pid].isSuspended := false
+            ; Reset CPU time tracking after resume
+            UpdateProcessCpuTimes(pid)
+        }
+        return
+    }
+
+    ; Get current CPU usage
+    cpuPercent := GetProcessCpuPercent(pid)
+
+    ; If over the limit, suspend the process
+    if cpuPercent > tracking.targetPercent {
+        hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_SUSPEND_RESUME, "Int", false, "UInt", pid, "Ptr")
+        if hProc {
+            DllCall("Ntdll\NtSuspendProcess", "Ptr", hProc)
+            DllCall("Kernel32\CloseHandle", "Ptr", hProc)
+
+            ; Calculate how long to suspend based on how much over the limit
+            ; The more over the limit, the longer the suspension
+            overageRatio := cpuPercent / Max(tracking.targetPercent, 1)
+            suspendMs := Min(Max(50 * overageRatio, 50), 500)  ; 50-500ms suspension
+
+            cpuUsageTracking[pid].isSuspended := true
+            cpuUsageTracking[pid].suspendUntil := A_TickCount + suspendMs
+        }
     }
 }
