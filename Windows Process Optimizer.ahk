@@ -1,11 +1,11 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 
-; ====================================================================================
+; =============================================================================
 ; CONFIGURATION
-; ====================================================================================
+; =============================================================================
 
-; Global Settings
+; Global settings object containing all configuration options
 global CONFIG := {
     ; Operating Mode
     mode: "whitelist",                      ; "blacklist" = only throttle listed targets, "whitelist" = throttle all except listed
@@ -86,7 +86,13 @@ global CONFIG := {
     ]
 }
 
-; Helper function to get settings for a specific process (merges defaults with overrides)
+; -----------------------------------------------------------------------------
+; GetProcessSettings - Retrieves settings for a specific process
+; Merges default settings with any process-specific overrides from targets list
+; Parameters:
+;   processName - Name of the process to get settings for (optional)
+; Returns: Map containing all applicable settings
+; -----------------------------------------------------------------------------
 GetProcessSettings(processName := "") {
     global CONFIG
     settings := Map()
@@ -129,19 +135,25 @@ GetProcessSettings(processName := "") {
     return settings
 }
 
-; ====================================================================================
+; =============================================================================
 ; CONSTANTS & GLOBALS
-; ====================================================================================
+; =============================================================================
 
+; Process access rights
 PROCESS_QUERY_LIMITED_INFORMATION := 0x1000
 PROCESS_QUERY_INFORMATION := 0x0400
 PROCESS_SET_INFORMATION := 0x0200
 PROCESS_SET_QUOTA := 0x0100
 PROCESS_VM_READ := 0x0010
+PROCESS_SUSPEND_RESUME := 0x0800
+
+; Priority class constants
 IDLE_PRIORITY_CLASS := 0x0040
 BELOW_NORMAL_PRIORITY_CLASS := 0x4000
 PROCESS_MODE_BACKGROUND_BEGIN := 0x00100000
 PROCESS_MODE_BACKGROUND_END := 0x00200000
+
+; Structure sizes and offsets
 PROCESSENTRY32_SIZE := 304
 PROCESS_BASIC_INFO_SIZE := 48
 PROCESS_MEMORY_COUNTERS_SIZE := 72
@@ -150,25 +162,31 @@ PE32_PPID_OFFSET_X86 := 20
 PE32_PPID_OFFSET_X64 := 28
 PBI_PARENT_OFFSET_X86 := 20
 PBI_PARENT_OFFSET_X64 := 40
+
+; Timing constants
 SCAN_INTERVAL_MS := 15000
+CPU_RATE_CHECK_INTERVAL := 100
+
+; Other constants
 MAX_PATH_CHARS := 260
 
-handled := Map()
-suspendCycleTimers := Map()
-cpuRateLimitTimers := Map()
-cpuUsageTracking := Map()
+; State tracking maps
+handled := Map()                ; Processes currently being throttled
+suspendCycleTimers := Map()     ; Active suspend cycle timers by PID
+cpuRateLimitTimers := Map()     ; Active CPU rate limit timers by PID
+cpuUsageTracking := Map()       ; CPU usage tracking data by PID
+
+; Runtime state
 currentScriptPID := DllCall("Kernel32\GetCurrentProcessId", "UInt")
 currentForegroundPID := 0
 foregroundHookHandle := 0
 pendingForegroundChange := false
 
-PROCESS_SUSPEND_RESUME := 0x0800
-CPU_RATE_CHECK_INTERVAL := 100  ; Check CPU usage every 100ms
-
-; ====================================================================================
+; =============================================================================
 ; INITIALIZATION
-; ====================================================================================
+; =============================================================================
 
+; Set up cleanup handler and start monitoring
 OnExit(RestoreAllProcesses)
 A_IconTip := "Windows Process Optimizer`nInitializing..."
 ScanAndApplyAll()
@@ -176,10 +194,14 @@ SetupProcessWatcher()
 SetupForegroundWatcher()
 SetTimer(ScanAndApplyAll, SCAN_INTERVAL_MS)
 
-; ====================================================================================
+; =============================================================================
 ; MAIN SCAN LOGIC
-; ====================================================================================
+; =============================================================================
 
+; -----------------------------------------------------------------------------
+; ScanAndApplyAll - Main scan function that iterates all running processes
+; Applies throttling to eligible processes based on configuration
+; -----------------------------------------------------------------------------
 ScanAndApplyAll() {
     global handled, currentScriptPID, CONFIG
     foregroundPID := CONFIG.skipForegroundProcess ? GetForegroundProcessId() : 0
@@ -210,6 +232,13 @@ ScanAndApplyAll() {
     UpdateTrayTooltip(skipCounts.uwp, skipCounts.exception)
 }
 
+; -----------------------------------------------------------------------------
+; BuildTreeMap - Creates a map of PIDs in a process tree
+; Parameters:
+;   pid     - Root process ID
+;   enabled - Whether tree building is enabled
+; Returns: Map with PIDs as keys
+; -----------------------------------------------------------------------------
 BuildTreeMap(pid, enabled) {
     treeMap := Map()
     if (enabled && pid) {
@@ -219,6 +248,11 @@ BuildTreeMap(pid, enabled) {
     return treeMap
 }
 
+; -----------------------------------------------------------------------------
+; BuildExceptionTreeMap - Builds a map of all PIDs related to exception processes
+; Includes parent and child processes of any excepted process
+; Returns: Map with PIDs as keys
+; -----------------------------------------------------------------------------
 BuildExceptionTreeMap() {
     global CONFIG
     exceptionTreePIDs := Map()
@@ -255,6 +289,16 @@ BuildExceptionTreeMap() {
     return exceptionTreePIDs
 }
 
+; -----------------------------------------------------------------------------
+; ShouldSkipProcess - Determines if a process should be excluded from throttling
+; Parameters:
+;   pid                - Process ID to check
+;   foregroundPID      - Current foreground process ID
+;   foregroundTreePIDs - Map of foreground process tree PIDs
+;   exceptionTreePIDs  - Map of exception process tree PIDs
+;   skipCounts         - Reference to skip counter object
+; Returns: true if process should be skipped, false otherwise
+; -----------------------------------------------------------------------------
 ShouldSkipProcess(pid, foregroundPID, foregroundTreePIDs, exceptionTreePIDs, &skipCounts) {
     global handled, currentScriptPID, CONFIG
 
@@ -294,6 +338,11 @@ ShouldSkipProcess(pid, foregroundPID, foregroundTreePIDs, exceptionTreePIDs, &sk
     return false
 }
 
+; -----------------------------------------------------------------------------
+; RestoreIfHandled - Restores a process to original state if currently throttled
+; Parameters:
+;   pid - Process ID to restore
+; -----------------------------------------------------------------------------
 RestoreIfHandled(pid) {
     global handled
     if handled.Has(pid) {
@@ -303,6 +352,11 @@ RestoreIfHandled(pid) {
     }
 }
 
+; -----------------------------------------------------------------------------
+; ProcessBackgroundApp - Applies throttling to a background process
+; Parameters:
+;   pid - Process ID to throttle
+; -----------------------------------------------------------------------------
 ProcessBackgroundApp(pid) {
     global handled
     if !handled.Has(pid) {
@@ -329,6 +383,12 @@ ProcessBackgroundApp(pid) {
     }
 }
 
+; -----------------------------------------------------------------------------
+; UpdateTrayTooltip - Updates the system tray icon tooltip with current status
+; Parameters:
+;   uwpCount       - Number of skipped UWP apps
+;   exceptionCount - Number of skipped exception processes
+; -----------------------------------------------------------------------------
 UpdateTrayTooltip(uwpCount := 0, exceptionCount := 0) {
     global handled, CONFIG
     foregroundPID := GetForegroundProcessId()
@@ -351,6 +411,9 @@ UpdateTrayTooltip(uwpCount := 0, exceptionCount := 0) {
     A_IconTip := tooltip
 }
 
+; -----------------------------------------------------------------------------
+; SetupProcessWatcher - Sets up WMI event subscription for new process creation
+; -----------------------------------------------------------------------------
 SetupProcessWatcher() {
     query := "SELECT ProcessId FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'"
     sink := ComObject("WbemScripting.SWbemSink")
@@ -359,6 +422,9 @@ SetupProcessWatcher() {
     wmi.ExecNotificationQueryAsync(sink, query)
 }
 
+; -----------------------------------------------------------------------------
+; SetupForegroundWatcher - Sets up hook for foreground window change events
+; -----------------------------------------------------------------------------
 SetupForegroundWatcher() {
     global foregroundHookHandle, currentForegroundPID
     callback := CallbackCreate(OnForegroundWindowChanged, "F", 7)
@@ -367,6 +433,10 @@ SetupForegroundWatcher() {
     currentForegroundPID := GetForegroundProcessId()
 }
 
+; -----------------------------------------------------------------------------
+; OnForegroundWindowChanged - Callback for foreground window change events
+; Schedules deferred processing to avoid rapid switching overhead
+; -----------------------------------------------------------------------------
 OnForegroundWindowChanged(hWinEventHook, event, hwnd, idObject, idChild, idEventThread, dwmsEventTime) {
     global currentForegroundPID, CONFIG, pendingForegroundChange
     if !CONFIG.skipForegroundProcess
@@ -381,6 +451,10 @@ OnForegroundWindowChanged(hWinEventHook, event, hwnd, idObject, idChild, idEvent
     SetTimer(ProcessForegroundChange, -50)
 }
 
+; -----------------------------------------------------------------------------
+; ProcessForegroundChange - Handles foreground window change
+; Restores new foreground process and throttles previous foreground process
+; -----------------------------------------------------------------------------
 ProcessForegroundChange() {
     global pendingForegroundChange, currentForegroundPID, handled, CONFIG
     static lastProcessedPID := 0
@@ -399,6 +473,11 @@ ProcessForegroundChange() {
     UpdateTrayTooltip()
 }
 
+; -----------------------------------------------------------------------------
+; ApplyToProcessList - Applies throttling to a list of processes
+; Parameters:
+;   pidList - Array of process IDs to throttle
+; -----------------------------------------------------------------------------
 ApplyToProcessList(pidList) {
     global handled, currentScriptPID, CONFIG
     for _, targetPID in pidList {
@@ -428,11 +507,20 @@ ApplyToProcessList(pidList) {
     }
 }
 
+; -----------------------------------------------------------------------------
+; RestoreProcessList - Restores a list of processes to original state
+; Parameters:
+;   pidList - Array of process IDs to restore
+; -----------------------------------------------------------------------------
 RestoreProcessList(pidList) {
     for _, targetPID in pidList
         RestoreIfHandled(targetPID)
 }
 
+; -----------------------------------------------------------------------------
+; OnProcessCreated_OnObjectReady - WMI callback for new process creation events
+; Applies throttling to newly created processes if eligible
+; -----------------------------------------------------------------------------
 OnProcessCreated_OnObjectReady(objWbemObject, objWbemAsyncContext) {
     global currentScriptPID, CONFIG, handled
     try {
@@ -470,6 +558,12 @@ OnProcessCreated_OnObjectReady(objWbemObject, objWbemAsyncContext) {
     }
 }
 
+; -----------------------------------------------------------------------------
+; IsWindowsApp - Checks if a process is a UWP/Microsoft Store app
+; Parameters:
+;   pid - Process ID to check
+; Returns: true if UWP app, false otherwise
+; -----------------------------------------------------------------------------
 IsWindowsApp(pid) {
     hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_QUERY_LIMITED_INFORMATION, "Int", false, "UInt", pid,
         "Ptr")
@@ -484,6 +578,12 @@ IsWindowsApp(pid) {
     }
 }
 
+; -----------------------------------------------------------------------------
+; GetProcessName - Retrieves the executable name for a process
+; Parameters:
+;   pid - Process ID
+; Returns: Executable filename or empty string on failure
+; -----------------------------------------------------------------------------
 GetProcessName(pid) {
     hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_QUERY_LIMITED_INFORMATION, "Int", false, "UInt", pid,
         "Ptr")
@@ -504,6 +604,10 @@ GetProcessName(pid) {
     }
 }
 
+; -----------------------------------------------------------------------------
+; GetForegroundProcessId - Gets the PID of the current foreground window's process
+; Returns: Process ID or 0 if no foreground window
+; -----------------------------------------------------------------------------
 GetForegroundProcessId() {
     hWnd := DllCall("User32\GetForegroundWindow", "Ptr")
     if !hWnd
@@ -513,6 +617,12 @@ GetForegroundProcessId() {
     return pid
 }
 
+; -----------------------------------------------------------------------------
+; GetParentProcessId - Gets the parent process ID for a given process
+; Parameters:
+;   pid - Process ID
+; Returns: Parent process ID or 0 on failure
+; -----------------------------------------------------------------------------
 GetParentProcessId(pid) {
     hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_QUERY_LIMITED_INFORMATION, "Int", false, "UInt", pid,
         "Ptr")
@@ -533,6 +643,12 @@ GetParentProcessId(pid) {
     }
 }
 
+; -----------------------------------------------------------------------------
+; IsException - Checks if a process is in the exception list
+; Parameters:
+;   pid - Process ID to check
+; Returns: true if excepted, false otherwise
+; -----------------------------------------------------------------------------
 IsException(pid) {
     global CONFIG
     processName := GetProcessName(pid)
@@ -545,6 +661,13 @@ IsException(pid) {
     return false
 }
 
+; -----------------------------------------------------------------------------
+; IsTargetApp - Checks if a process is in the target list (for blacklist mode)
+; Supports both simple string entries and object entries with name/names
+; Parameters:
+;   pid - Process ID to check
+; Returns: true if targeted, false otherwise
+; -----------------------------------------------------------------------------
 IsTargetApp(pid) {
     global CONFIG
     processName := GetProcessName(pid)
@@ -555,7 +678,6 @@ IsTargetApp(pid) {
             if (StrLower(processName) = StrLower(target))
                 return true
         } else if (Type(target) = "Object") {
-            ; Support both "name" (single) and "names" (array)
             if target.HasOwnProp("name") && (StrLower(processName) = StrLower(target.name))
                 return true
             if target.HasOwnProp("names") {
@@ -569,6 +691,12 @@ IsTargetApp(pid) {
     return false
 }
 
+; -----------------------------------------------------------------------------
+; GetProcessPriority - Gets the current priority class of a process
+; Parameters:
+;   pid - Process ID
+; Returns: Priority class value or 0 on failure
+; -----------------------------------------------------------------------------
 GetProcessPriority(pid) {
     hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_QUERY_LIMITED_INFORMATION, "Int", false, "UInt", pid,
         "Ptr")
@@ -581,6 +709,12 @@ GetProcessPriority(pid) {
     }
 }
 
+; -----------------------------------------------------------------------------
+; GetProcessTreePIDs - Gets all PIDs in a process tree (parent, children, same name)
+; Parameters:
+;   rootPid - Root process ID to build tree from
+; Returns: Array of all related process IDs
+; -----------------------------------------------------------------------------
 GetProcessTreePIDs(rootPid) {
     treePIDs := [rootPid]
     rootName := GetProcessName(rootPid)
@@ -628,6 +762,13 @@ GetProcessTreePIDs(rootPid) {
     return treePIDs
 }
 
+; -----------------------------------------------------------------------------
+; ArrayHas - Checks if an array contains a value
+; Parameters:
+;   arr   - Array to search
+;   value - Value to find
+; Returns: true if found, false otherwise
+; -----------------------------------------------------------------------------
 ArrayHas(arr, value) {
     for item in arr {
         if (item = value)
@@ -636,10 +777,14 @@ ArrayHas(arr, value) {
     return false
 }
 
+; -----------------------------------------------------------------------------
+; RestoreAllProcesses - Cleanup function called on script exit
+; Restores all throttled processes to their original state
+; -----------------------------------------------------------------------------
 RestoreAllProcesses(*) {
     global handled, foregroundHookHandle, suspendCycleTimers, cpuRateLimitTimers, cpuUsageTracking
 
-    ; Stop foreground hook
+    ; Stop foreground window hook
     if foregroundHookHandle {
         DllCall("User32\UnhookWinEvent", "Ptr", foregroundHookHandle)
         foregroundHookHandle := 0
@@ -665,17 +810,24 @@ RestoreAllProcesses(*) {
     handled.Clear()
 }
 
+; -----------------------------------------------------------------------------
+; RestoreProcess - Restores a single process to its original state
+; Parameters:
+;   pid              - Process ID to restore
+;   originalPriority - Original priority class to restore
+;   originalAffinity - Original CPU affinity mask to restore (optional)
+; Returns: true on success, false on failure
+; -----------------------------------------------------------------------------
 RestoreProcess(pid, originalPriority, originalAffinity := 0) {
     global handled, CONFIG, PROCESS_SUSPEND_RESUME
 
-    ; Stop suspend cycle and CPU rate limiter if active (these also resume the process)
+    ; Stop active throttling mechanisms (these also resume the process)
     StopSuspendCycle(pid)
     StopCpuRateLimiter(pid)
 
-    ; Ensure process is fully resumed (in case it was suspended by either mechanism)
+    ; Ensure process is fully resumed (resume multiple times for nested suspensions)
     hResume := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_SUSPEND_RESUME, "Int", false, "UInt", pid, "Ptr")
     if hResume {
-        ; Resume multiple times to handle nested suspensions
         loop 5
             DllCall("Ntdll\NtResumeProcess", "Ptr", hResume)
         DllCall("Kernel32\CloseHandle", "Ptr", hResume)
@@ -686,7 +838,7 @@ RestoreProcess(pid, originalPriority, originalAffinity := 0) {
     if !hProc
         return false
     try {
-        ; Get the settings that were used for this process
+        ; Retrieve settings used for this process
         processName := ""
         if handled.Has(pid) && handled[pid].HasOwnProp("processName")
             processName := handled[pid].processName
@@ -703,14 +855,16 @@ RestoreProcess(pid, originalPriority, originalAffinity := 0) {
             NumPut("UInt", 2, ioPriority, 0)
             DllCall("Ntdll\NtSetInformationProcess", "Ptr", hProc, "Int", 33, "Ptr", ioPriority.Ptr, "UInt", 4)
         }
-        ; Restore page priority to normal
+        ; Restore page priority to normal (5 = normal priority)
         if settings["usePagePriority"] {
             pagePriority := Buffer(4, 0)
-            NumPut("UInt", 5, pagePriority, 0)  ; Normal priority
+            NumPut("UInt", 5, pagePriority, 0)
             DllCall("Ntdll\NtSetInformationProcess", "Ptr", hProc, "Int", 39, "Ptr", pagePriority.Ptr, "UInt", 4)
         }
+        ; Restore CPU affinity
         if (settings["useCpuAffinity"] && originalAffinity)
             DllCall("Kernel32\SetProcessAffinityMask", "Ptr", hProc, "UPtr", originalAffinity)
+
         ; Remove working set limits
         if settings["useWorkingSetLimit"]
             DllCall("Kernel32\SetProcessWorkingSetSizeEx", "Ptr", hProc, "Ptr", -1, "Ptr", -1, "UInt", 0)
@@ -720,6 +874,12 @@ RestoreProcess(pid, originalPriority, originalAffinity := 0) {
     }
 }
 
+; -----------------------------------------------------------------------------
+; GetProcessMemoryMB - Gets the working set memory usage of a process in MB
+; Parameters:
+;   pid - Process ID
+; Returns: Memory usage in megabytes or 0 on failure
+; -----------------------------------------------------------------------------
 GetProcessMemoryMB(pid) {
     access := PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ
     hProc := DllCall("Kernel32\OpenProcess", "UInt", access, "Int", false, "UInt", pid, "Ptr")
@@ -738,6 +898,15 @@ GetProcessMemoryMB(pid) {
     }
 }
 
+; -----------------------------------------------------------------------------
+; TrimProcessMemory - Reduces the working set memory of a process
+; Parameters:
+;   pid         - Process ID
+;   thresholdMB - Only trim if memory exceeds this value (default: 100)
+;   aggressive  - Use multiple trim passes (default: true)
+;   passes      - Number of trim passes for aggressive mode (default: 3)
+; Returns: true if trimmed, false otherwise
+; -----------------------------------------------------------------------------
 TrimProcessMemory(pid, thresholdMB := 100, aggressive := true, passes := 3) {
     memoryMB := GetProcessMemoryMB(pid)
     if (memoryMB < thresholdMB)
@@ -764,6 +933,14 @@ TrimProcessMemory(pid, thresholdMB := 100, aggressive := true, passes := 3) {
     }
 }
 
+; -----------------------------------------------------------------------------
+; ApplyEfficiencyLikeMode - Applies all throttling settings to a process
+; Sets priority, QoS, I/O priority, CPU affinity, memory limits, and more
+; Parameters:
+;   pid      - Process ID to throttle
+;   settings - Map of settings to apply
+; Returns: Object with success status and original affinity mask
+; -----------------------------------------------------------------------------
 ApplyEfficiencyLikeMode(pid, settings) {
     global suspendCycleTimers
     access := PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_QUERY_INFORMATION |
@@ -794,13 +971,13 @@ ApplyEfficiencyLikeMode(pid, settings) {
             NumPut("UInt", 0, ioPriority, 0)
             DllCall("Ntdll\NtSetInformationProcess", "Ptr", hProc, "Int", 33, "Ptr", ioPriority.Ptr, "UInt", 4)
         }
-        ; Page priority (memory manager priority)
+        ; Set page priority (memory manager priority)
         if settings["usePagePriority"] {
             pagePriority := Buffer(4, 0)
             NumPut("UInt", settings["pagePriority"], pagePriority, 0)
             DllCall("Ntdll\NtSetInformationProcess", "Ptr", hProc, "Int", 39, "Ptr", pagePriority.Ptr, "UInt", 4)
         }
-        ; CPU affinity - single core overrides mask
+        ; Set CPU affinity (single core setting overrides affinity mask)
         if settings["useCpuAffinity"] {
             systemAffinity := 0
             if DllCall("Kernel32\GetProcessAffinityMask", "Ptr", hProc, "UPtr*", &originalAffinity, "UPtr*", &
@@ -811,17 +988,18 @@ ApplyEfficiencyLikeMode(pid, settings) {
                 DllCall("Kernel32\SetProcessAffinityMask", "Ptr", hProc, "UPtr", affinityMask)
             }
         }
-        ; Working set limits
+        ; Set working set limits (0x6 = QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE)
         if settings["useWorkingSetLimit"] {
-            minWS := 1024 * 1024  ; 1 MB minimum
+            minWS := 1024 * 1024
             maxWS := settings["workingSetLimitMB"] * 1024 * 1024
-            DllCall("Kernel32\SetProcessWorkingSetSizeEx", "Ptr", hProc, "Ptr", minWS, "Ptr", maxWS, "UInt", 0x6)  ; QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE
+            DllCall("Kernel32\SetProcessWorkingSetSizeEx", "Ptr", hProc, "Ptr", minWS, "Ptr", maxWS, "UInt", 0x6)
         }
-        ; CPU rate limiting via active monitoring and suspend/resume
+
+        ; Start CPU rate limiting via active monitoring
         if settings["useCpuRateLimit"] {
             StartCpuRateLimiter(pid, settings["cpuRateLimitPercent"])
         }
-        ; Suspend cycles - start timer for this PID
+        ; Start suspend/resume cycles
         if settings["useSuspendCycles"] {
             suspendDuration := settings["suspendDurationMs"]
             resumeDuration := settings["resumeDurationMs"]
@@ -836,23 +1014,35 @@ ApplyEfficiencyLikeMode(pid, settings) {
     }
 }
 
+; -----------------------------------------------------------------------------
+; SuspendCycleCallback - Timer callback for suspend/resume cycling
+; Parameters:
+;   pid       - Process ID to suspend
+;   suspendMs - Duration to keep process suspended
+;   resumeMs  - Duration to allow process to run (unused, handled by interval)
+; -----------------------------------------------------------------------------
 SuspendCycleCallback(pid, suspendMs, resumeMs) {
     global PROCESS_SUSPEND_RESUME, handled
-    ; Check if process is still being handled
+
+    ; Verify process is still being managed
     if !handled.Has(pid) {
         StopSuspendCycle(pid)
         return
     }
-    ; Suspend the process
+    ; Suspend the process and schedule resume
     hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_SUSPEND_RESUME, "Int", false, "UInt", pid, "Ptr")
     if !hProc
         return
     DllCall("Ntdll\NtSuspendProcess", "Ptr", hProc)
     DllCall("Kernel32\CloseHandle", "Ptr", hProc)
-    ; Schedule resume after suspendMs
     SetTimer(ResumeProcessCallback.Bind(pid), -suspendMs)
 }
 
+; -----------------------------------------------------------------------------
+; ResumeProcessCallback - Timer callback to resume a suspended process
+; Parameters:
+;   pid - Process ID to resume
+; -----------------------------------------------------------------------------
 ResumeProcessCallback(pid) {
     global PROCESS_SUSPEND_RESUME
     hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_SUSPEND_RESUME, "Int", false, "UInt", pid, "Ptr")
@@ -862,24 +1052,35 @@ ResumeProcessCallback(pid) {
     DllCall("Kernel32\CloseHandle", "Ptr", hProc)
 }
 
+; -----------------------------------------------------------------------------
+; StopSuspendCycle - Stops the suspend/resume cycle for a process
+; Parameters:
+;   pid - Process ID to stop cycling
+; -----------------------------------------------------------------------------
 StopSuspendCycle(pid) {
     global suspendCycleTimers
     if suspendCycleTimers.Has(pid) {
         SetTimer(suspendCycleTimers[pid], 0)
         suspendCycleTimers.Delete(pid)
-        ; Ensure process is resumed
         ResumeProcessCallback(pid)
     }
 }
 
-; ====================================================================================
-; CPU RATE LIMITER (Active monitoring with suspend/resume)
-; ====================================================================================
+; =============================================================================
+; CPU RATE LIMITER
+; Active monitoring with suspend/resume to enforce CPU usage limits
+; =============================================================================
 
+; -----------------------------------------------------------------------------
+; StartCpuRateLimiter - Starts CPU rate limiting for a process
+; Parameters:
+;   pid           - Process ID to limit
+;   targetPercent - Maximum CPU usage percentage allowed
+; -----------------------------------------------------------------------------
 StartCpuRateLimiter(pid, targetPercent) {
     global cpuRateLimitTimers, cpuUsageTracking, CPU_RATE_CHECK_INTERVAL
 
-    ; Initialize tracking for this process
+    ; Initialize tracking state for this process
     cpuUsageTracking[pid] := {
         targetPercent: targetPercent,
         lastKernelTime: 0,
@@ -889,25 +1090,29 @@ StartCpuRateLimiter(pid, targetPercent) {
         suspendUntil: 0
     }
 
-    ; Get initial CPU times
+    ; Get initial CPU times and start monitoring timer
     UpdateProcessCpuTimes(pid)
-
-    ; Start the monitoring timer
     boundFunc := CpuRateLimitCallback.Bind(pid)
     SetTimer(boundFunc, CPU_RATE_CHECK_INTERVAL)
     cpuRateLimitTimers[pid] := boundFunc
 }
 
+; -----------------------------------------------------------------------------
+; StopCpuRateLimiter - Stops CPU rate limiting for a process
+; Parameters:
+;   pid - Process ID to stop limiting
+; -----------------------------------------------------------------------------
 StopCpuRateLimiter(pid) {
     global cpuRateLimitTimers, cpuUsageTracking, PROCESS_SUSPEND_RESUME
 
+    ; Stop the monitoring timer
     if cpuRateLimitTimers.Has(pid) {
         SetTimer(cpuRateLimitTimers[pid], 0)
         cpuRateLimitTimers.Delete(pid)
     }
 
+    ; Clean up tracking and ensure process is resumed
     if cpuUsageTracking.Has(pid) {
-        ; Ensure process is resumed if it was suspended
         if cpuUsageTracking[pid].isSuspended {
             hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_SUSPEND_RESUME, "Int", false, "UInt", pid, "Ptr")
             if hProc {
@@ -919,6 +1124,12 @@ StopCpuRateLimiter(pid) {
     }
 }
 
+; -----------------------------------------------------------------------------
+; UpdateProcessCpuTimes - Updates stored CPU time values for a process
+; Parameters:
+;   pid - Process ID to update
+; Returns: true on success, false on failure
+; -----------------------------------------------------------------------------
 UpdateProcessCpuTimes(pid) {
     global cpuUsageTracking, PROCESS_QUERY_LIMITED_INFORMATION
 
@@ -949,6 +1160,13 @@ UpdateProcessCpuTimes(pid) {
     return false
 }
 
+; -----------------------------------------------------------------------------
+; GetProcessCpuPercent - Calculates current CPU usage percentage for a process
+; Uses delta between current and previous measurements
+; Parameters:
+;   pid - Process ID to measure
+; Returns: CPU usage percentage (0-100+)
+; -----------------------------------------------------------------------------
 GetProcessCpuPercent(pid) {
     global cpuUsageTracking, PROCESS_QUERY_LIMITED_INFORMATION
 
@@ -977,25 +1195,25 @@ GetProcessCpuPercent(pid) {
             currentUser := NumGet(userTime, 0, "Int64")
             currentTime := A_TickCount
 
-            ; Update stored values
+            ; Update stored values for next calculation
             cpuUsageTracking[pid].lastKernelTime := currentKernel
             cpuUsageTracking[pid].lastUserTime := currentUser
             cpuUsageTracking[pid].lastCheckTime := currentTime
 
-            ; Calculate CPU usage (times are in 100-nanosecond intervals)
+            ; Calculate elapsed time and CPU time delta (times are in 100ns intervals)
             elapsedMs := currentTime - prevTime
             if elapsedMs <= 0
                 return 0
 
             cpuTimeDelta := (currentKernel - prevKernel) + (currentUser - prevUser)
-            cpuTimeMs := cpuTimeDelta / 10000  ; Convert 100ns to ms
+            cpuTimeMs := cpuTimeDelta / 10000
 
-            ; Get number of processors for accurate percentage
+            ; Get processor count for accurate percentage calculation
             numProcessors := DllCall("Kernel32\GetActiveProcessorCount", "UShort", 0xFFFF, "UInt")
             if numProcessors < 1
                 numProcessors := 1
 
-            ; Calculate percentage (CPU time / wall time / num processors * 100)
+            ; Calculate percentage: (CPU time / wall time / processors) * 100
             cpuPercent := (cpuTimeMs / elapsedMs / numProcessors) * 100
             return cpuPercent
         }
@@ -1005,10 +1223,16 @@ GetProcessCpuPercent(pid) {
     return 0
 }
 
+; -----------------------------------------------------------------------------
+; CpuRateLimitCallback - Timer callback for CPU rate limit enforcement
+; Monitors CPU usage and suspends process when over limit
+; Parameters:
+;   pid - Process ID to monitor
+; -----------------------------------------------------------------------------
 CpuRateLimitCallback(pid) {
     global cpuUsageTracking, handled, PROCESS_SUSPEND_RESUME
 
-    ; Check if process is still being handled
+    ; Verify process is still being managed
     if !handled.Has(pid) || !cpuUsageTracking.Has(pid) {
         StopCpuRateLimiter(pid)
         return
@@ -1016,36 +1240,32 @@ CpuRateLimitCallback(pid) {
 
     tracking := cpuUsageTracking[pid]
 
-    ; If process is suspended and waiting, check if it's time to resume
+    ; Check if suspended process should be resumed
     if tracking.isSuspended {
         if A_TickCount >= tracking.suspendUntil {
-            ; Resume the process
             hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_SUSPEND_RESUME, "Int", false, "UInt", pid, "Ptr")
             if hProc {
                 DllCall("Ntdll\NtResumeProcess", "Ptr", hProc)
                 DllCall("Kernel32\CloseHandle", "Ptr", hProc)
             }
             cpuUsageTracking[pid].isSuspended := false
-            ; Reset CPU time tracking after resume
             UpdateProcessCpuTimes(pid)
         }
         return
     }
 
-    ; Get current CPU usage
+    ; Check CPU usage and suspend if over limit
     cpuPercent := GetProcessCpuPercent(pid)
 
-    ; If over the limit, suspend the process
     if cpuPercent > tracking.targetPercent {
         hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_SUSPEND_RESUME, "Int", false, "UInt", pid, "Ptr")
         if hProc {
             DllCall("Ntdll\NtSuspendProcess", "Ptr", hProc)
             DllCall("Kernel32\CloseHandle", "Ptr", hProc)
 
-            ; Calculate how long to suspend based on how much over the limit
-            ; The more over the limit, the longer the suspension
+            ; Calculate suspension duration based on overage (50-500ms)
             overageRatio := cpuPercent / Max(tracking.targetPercent, 1)
-            suspendMs := Min(Max(50 * overageRatio, 50), 500)  ; 50-500ms suspension
+            suspendMs := Min(Max(50 * overageRatio, 50), 500)
 
             cpuUsageTracking[pid].isSuspended := true
             cpuUsageTracking[pid].suspendUntil := A_TickCount + suspendMs
