@@ -8,9 +8,9 @@
 ; Global Settings
 global CONFIG := {
     ; Operating Mode
-    mode: "blacklist",                      ; "blacklist" = only throttle listed targets, "whitelist" = throttle all except listed
+    mode: "whitelist",                      ; "blacklist" = only throttle listed targets, "whitelist" = throttle all except listed
     ; Skip Conditions
-    skipWindowsApps: false,                 ; Skip UWP/Microsoft Store apps
+    skipWindowsApps: true,                 ; Skip UWP/Microsoft Store apps
     skipForegroundProcess: true,            ; Don't throttle the currently active window's process
     skipForegroundProcessTree: true,        ; Don't throttle parent/child processes of foreground app
     skipExceptionProcessTree: true,         ; Don't throttle parent/child processes of exception apps
@@ -637,22 +637,49 @@ ArrayHas(arr, value) {
 }
 
 RestoreAllProcesses(*) {
-    global handled, foregroundHookHandle
+    global handled, foregroundHookHandle, suspendCycleTimers, cpuRateLimitTimers, cpuUsageTracking
+
+    ; Stop foreground hook
     if foregroundHookHandle {
         DllCall("User32\UnhookWinEvent", "Ptr", foregroundHookHandle)
         foregroundHookHandle := 0
     }
+
+    ; Stop all suspend cycle timers
+    for pid, timerFunc in suspendCycleTimers.Clone() {
+        SetTimer(timerFunc, 0)
+    }
+    suspendCycleTimers.Clear()
+
+    ; Stop all CPU rate limit timers
+    for pid, timerFunc in cpuRateLimitTimers.Clone() {
+        SetTimer(timerFunc, 0)
+    }
+    cpuRateLimitTimers.Clear()
+    cpuUsageTracking.Clear()
+
+    ; Restore all handled processes
     for pid, info in handled {
         RestoreProcess(pid, info.priority, info.HasOwnProp("originalAffinity") ? info.originalAffinity : 0)
     }
+    handled.Clear()
 }
 
 RestoreProcess(pid, originalPriority, originalAffinity := 0) {
-    global handled, CONFIG
+    global handled, CONFIG, PROCESS_SUSPEND_RESUME
 
-    ; Stop suspend cycle and CPU rate limiter if active
+    ; Stop suspend cycle and CPU rate limiter if active (these also resume the process)
     StopSuspendCycle(pid)
     StopCpuRateLimiter(pid)
+
+    ; Ensure process is fully resumed (in case it was suspended by either mechanism)
+    hResume := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_SUSPEND_RESUME, "Int", false, "UInt", pid, "Ptr")
+    if hResume {
+        ; Resume multiple times to handle nested suspensions
+        loop 5
+            DllCall("Ntdll\NtResumeProcess", "Ptr", hResume)
+        DllCall("Kernel32\CloseHandle", "Ptr", hResume)
+    }
 
     access := PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA
     hProc := DllCall("Kernel32\OpenProcess", "UInt", access, "Int", false, "UInt", pid, "Ptr")
@@ -898,7 +925,8 @@ UpdateProcessCpuTimes(pid) {
     if !cpuUsageTracking.Has(pid)
         return false
 
-    hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_QUERY_LIMITED_INFORMATION, "Int", false, "UInt", pid, "Ptr")
+    hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_QUERY_LIMITED_INFORMATION, "Int", false, "UInt", pid,
+        "Ptr")
     if !hProc
         return false
 
@@ -908,7 +936,8 @@ UpdateProcessCpuTimes(pid) {
         kernelTime := Buffer(8, 0)
         userTime := Buffer(8, 0)
 
-        if DllCall("Kernel32\GetProcessTimes", "Ptr", hProc, "Ptr", creationTime.Ptr, "Ptr", exitTime.Ptr, "Ptr", kernelTime.Ptr, "Ptr", userTime.Ptr, "Int") {
+        if DllCall("Kernel32\GetProcessTimes", "Ptr", hProc, "Ptr", creationTime.Ptr, "Ptr", exitTime.Ptr, "Ptr",
+            kernelTime.Ptr, "Ptr", userTime.Ptr, "Int") {
             cpuUsageTracking[pid].lastKernelTime := NumGet(kernelTime, 0, "Int64")
             cpuUsageTracking[pid].lastUserTime := NumGet(userTime, 0, "Int64")
             cpuUsageTracking[pid].lastCheckTime := A_TickCount
@@ -931,7 +960,8 @@ GetProcessCpuPercent(pid) {
     prevUser := tracking.lastUserTime
     prevTime := tracking.lastCheckTime
 
-    hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_QUERY_LIMITED_INFORMATION, "Int", false, "UInt", pid, "Ptr")
+    hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_QUERY_LIMITED_INFORMATION, "Int", false, "UInt", pid,
+        "Ptr")
     if !hProc
         return 0
 
@@ -941,7 +971,8 @@ GetProcessCpuPercent(pid) {
         kernelTime := Buffer(8, 0)
         userTime := Buffer(8, 0)
 
-        if DllCall("Kernel32\GetProcessTimes", "Ptr", hProc, "Ptr", creationTime.Ptr, "Ptr", exitTime.Ptr, "Ptr", kernelTime.Ptr, "Ptr", userTime.Ptr, "Int") {
+        if DllCall("Kernel32\GetProcessTimes", "Ptr", hProc, "Ptr", creationTime.Ptr, "Ptr", exitTime.Ptr, "Ptr",
+            kernelTime.Ptr, "Ptr", userTime.Ptr, "Int") {
             currentKernel := NumGet(kernelTime, 0, "Int64")
             currentUser := NumGet(userTime, 0, "Int64")
             currentTime := A_TickCount
