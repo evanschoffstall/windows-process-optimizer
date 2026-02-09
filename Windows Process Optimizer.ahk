@@ -14,6 +14,8 @@ global CONFIG := {
     skipForegroundProcess: true,            ; Don't throttle the currently active window's process
     skipForegroundProcessTree: true,        ; Don't throttle parent/child processes of foreground app
     skipExceptionProcessTree: true,         ; Don't throttle parent/child processes of exception apps
+    skipAvOutputProcesses: true,            ; Skip processes with active audio/video output
+    skipAvOutputProcessTree: true,          ; Skip parent/child processes of active A/V apps
     ; Default Settings (applied to all processes unless overridden)
     defaults: {
         enabled: true,                      ; Whether to throttle by default
@@ -167,6 +169,9 @@ PBI_PARENT_OFFSET_X64 := 40
 SCAN_INTERVAL_MS := 15000
 CPU_RATE_CHECK_INTERVAL := 100
 
+; COM activation constants
+CLSCTX_ALL := 0x17
+
 ; Other constants
 MAX_PATH_CHARS := 260
 
@@ -207,7 +212,9 @@ ScanAndApplyAll() {
     foregroundPID := CONFIG.skipForegroundProcess ? GetForegroundProcessId() : 0
     foregroundTreePIDs := BuildTreeMap(foregroundPID, CONFIG.skipForegroundProcessTree)
     exceptionTreePIDs := BuildExceptionTreeMap()
-    skipCounts := { uwp: 0, exception: 0 }
+    audioPIDs := CONFIG.skipAvOutputProcesses ? GetActiveAudioSessionPids() : Map()
+    audioTreePIDs := BuildAvOutputTreeMap(audioPIDs, CONFIG.skipAvOutputProcessTree)
+    skipCounts := { uwp: 0, exception: 0, av: 0 }
 
     snapshot := DllCall("Kernel32\CreateToolhelp32Snapshot", "UInt", 0x2, "UInt", 0, "Ptr")
     if (snapshot = -1)
@@ -220,7 +227,8 @@ ScanAndApplyAll() {
         if DllCall("Kernel32\Process32First", "Ptr", snapshot, "Ptr", pe32) {
             loop {
                 pid := NumGet(pe32, PE32_PID_OFFSET, "UInt")
-                if (!ShouldSkipProcess(pid, foregroundPID, foregroundTreePIDs, exceptionTreePIDs, &skipCounts))
+                if (!ShouldSkipProcess(pid, foregroundPID, foregroundTreePIDs, exceptionTreePIDs, audioPIDs,
+                    audioTreePIDs, &skipCounts))
                     ProcessBackgroundApp(pid)
                 if !DllCall("Kernel32\Process32Next", "Ptr", snapshot, "Ptr", pe32)
                     break
@@ -229,7 +237,7 @@ ScanAndApplyAll() {
     } finally {
         DllCall("Kernel32\CloseHandle", "Ptr", snapshot)
     }
-    UpdateTrayTooltip(skipCounts.uwp, skipCounts.exception)
+    UpdateTrayTooltip(skipCounts.uwp, skipCounts.exception, skipCounts.av)
 }
 
 ; -----------------------------------------------------------------------------
@@ -290,6 +298,25 @@ BuildExceptionTreeMap() {
 }
 
 ; -----------------------------------------------------------------------------
+; BuildAvOutputTreeMap - Builds a map of all PIDs related to active A/V processes
+; Includes parent and child processes of any active audio/video process
+; Parameters:
+;   audioPIDs - Map of active audio session PIDs
+;   enabled   - Whether tree building is enabled
+; Returns: Map with PIDs as keys
+; -----------------------------------------------------------------------------
+BuildAvOutputTreeMap(audioPIDs, enabled) {
+    treeMap := Map()
+    if !enabled
+        return treeMap
+    for pid in audioPIDs {
+        for _, treePid in GetProcessTreePIDs(pid)
+            treeMap[treePid] := true
+    }
+    return treeMap
+}
+
+; -----------------------------------------------------------------------------
 ; ShouldSkipProcess - Determines if a process should be excluded from throttling
 ; Parameters:
 ;   pid                - Process ID to check
@@ -299,7 +326,7 @@ BuildExceptionTreeMap() {
 ;   skipCounts         - Reference to skip counter object
 ; Returns: true if process should be skipped, false otherwise
 ; -----------------------------------------------------------------------------
-ShouldSkipProcess(pid, foregroundPID, foregroundTreePIDs, exceptionTreePIDs, &skipCounts) {
+ShouldSkipProcess(pid, foregroundPID, foregroundTreePIDs, exceptionTreePIDs, audioPIDs, audioTreePIDs, &skipCounts) {
     global handled, currentScriptPID, CONFIG
 
     if (CONFIG.mode = "blacklist") {
@@ -322,6 +349,18 @@ ShouldSkipProcess(pid, foregroundPID, foregroundTreePIDs, exceptionTreePIDs, &sk
 
     if (CONFIG.skipWindowsApps && IsWindowsApp(pid)) {
         skipCounts.uwp++
+        return true
+    }
+
+    if (CONFIG.skipAvOutputProcesses && audioPIDs.Has(pid)) {
+        skipCounts.av++
+        RestoreIfHandled(pid)
+        return true
+    }
+
+    if (CONFIG.skipAvOutputProcessTree && audioTreePIDs.Has(pid)) {
+        skipCounts.av++
+        RestoreIfHandled(pid)
         return true
     }
 
@@ -389,7 +428,7 @@ ProcessBackgroundApp(pid) {
 ;   uwpCount       - Number of skipped UWP apps
 ;   exceptionCount - Number of skipped exception processes
 ; -----------------------------------------------------------------------------
-UpdateTrayTooltip(uwpCount := 0, exceptionCount := 0) {
+UpdateTrayTooltip(uwpCount := 0, exceptionCount := 0, avCount := 0) {
     global handled, CONFIG
     foregroundPID := GetForegroundProcessId()
     if !foregroundPID {
@@ -402,7 +441,7 @@ UpdateTrayTooltip(uwpCount := 0, exceptionCount := 0) {
     throttledCount := handled.Count
     treeSize := CONFIG.skipForegroundProcessTree ? GetProcessTreePIDs(foregroundPID).Length : (CONFIG.skipForegroundProcess ?
         1 : 0)
-    totalSkipped := uwpCount + treeSize + exceptionCount
+    totalSkipped := uwpCount + treeSize + exceptionCount + avCount
     tooltip := "Windows Process Optimizer`nMode: " . (CONFIG.mode = "blacklist" ? "Blacklist (Target Only)" :
         "Whitelist (All Except)")
     if CONFIG.skipForegroundProcess
@@ -480,12 +519,18 @@ ProcessForegroundChange() {
 ; -----------------------------------------------------------------------------
 ApplyToProcessList(pidList) {
     global handled, currentScriptPID, CONFIG
+    audioPIDs := CONFIG.skipAvOutputProcesses ? GetActiveAudioSessionPids() : Map()
+    audioTreePIDs := BuildAvOutputTreeMap(audioPIDs, CONFIG.skipAvOutputProcessTree)
     for _, targetPID in pidList {
         if (targetPID = currentScriptPID || (CONFIG.skipWindowsApps && IsWindowsApp(targetPID)))
             continue
         if (CONFIG.mode = "blacklist" && !IsTargetApp(targetPID))
             continue
         if (CONFIG.mode = "whitelist" && IsException(targetPID))
+            continue
+        if (CONFIG.skipAvOutputProcesses && audioPIDs.Has(targetPID))
+            continue
+        if (CONFIG.skipAvOutputProcessTree && audioTreePIDs.Has(targetPID))
             continue
         if !handled.Has(targetPID) {
             processName := GetProcessName(targetPID)
@@ -533,6 +578,16 @@ OnProcessCreated_OnObjectReady(objWbemObject, objWbemAsyncContext) {
             return
         if (CONFIG.mode = "whitelist" && IsException(pid))
             return
+        if (CONFIG.skipAvOutputProcesses) {
+            audioPIDs := GetActiveAudioSessionPids()
+            if (audioPIDs.Has(pid))
+                return
+            if (CONFIG.skipAvOutputProcessTree) {
+                audioTreePIDs := BuildAvOutputTreeMap(audioPIDs, true)
+                if (audioTreePIDs.Has(pid))
+                    return
+            }
+        }
 
         processName := GetProcessName(pid)
         settings := GetProcessSettings(processName)
@@ -556,6 +611,85 @@ OnProcessCreated_OnObjectReady(objWbemObject, objWbemAsyncContext) {
                 originalAffinity: result.originalAffinity, processName: processName }
         }
     }
+}
+
+; -----------------------------------------------------------------------------
+; GetActiveAudioSessionPids - Returns PIDs for processes with active audio output
+; Uses Core Audio session enumeration (IAudioSessionManager2)
+; Returns: Map of PID => true
+; -----------------------------------------------------------------------------
+GetActiveAudioSessionPids() {
+    global CLSCTX_ALL
+    pids := Map()
+
+    try {
+        enumerator := ComObject("clsid:{BCDE0395-E52F-467C-8E3D-C4579291692E}",
+            "{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+    } catch {
+        return pids
+    }
+
+    devicePtr := 0
+    if (ComCall(4, enumerator, "UInt", 0, "UInt", 1, "Ptr*", &devicePtr) != 0 || !devicePtr)
+        return pids
+    device := ComObjFromPtr(devicePtr)
+
+    iidAsm := GUIDFromString("{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}")
+    asmPtr := 0
+    if (ComCall(3, device, "Ptr", iidAsm.Ptr, "UInt", CLSCTX_ALL, "Ptr", 0, "Ptr*", &asmPtr) != 0 || !asmPtr)
+        return pids
+    asm := ComObjFromPtr(asmPtr)
+
+    enumPtr := 0
+    if (ComCall(5, asm, "Ptr*", &enumPtr) != 0 || !enumPtr)
+        return pids
+    sessionEnum := ComObjFromPtr(enumPtr)
+
+    count := 0
+    if (ComCall(3, sessionEnum, "UInt*", &count) != 0)
+        return pids
+
+    loop count {
+        index := A_Index - 1
+        sessionPtr := 0
+        if (ComCall(4, sessionEnum, "UInt", index, "Ptr*", &sessionPtr) != 0 || !sessionPtr)
+            continue
+        session := ComObjFromPtr(sessionPtr)
+        try {
+            session2 := ComObjQuery(session, "{BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D}")
+        } catch {
+            continue
+        }
+
+        state := 0
+        if (ComCall(3, session2, "UInt*", &state) != 0)
+            continue
+        if (state != 1)
+            continue
+
+        isSystem := 0
+        ComCall(15, session2, "Int*", &isSystem)
+        if (isSystem)
+            continue
+
+        pid := 0
+        if (ComCall(14, session2, "UInt*", &pid) = 0 && pid)
+            pids[pid] := true
+    }
+
+    return pids
+}
+
+; -----------------------------------------------------------------------------
+; GUIDFromString - Converts a GUID string to a binary GUID buffer
+; Parameters:
+;   guidStr - GUID string in braces
+; Returns: Buffer with GUID data
+; -----------------------------------------------------------------------------
+GUIDFromString(guidStr) {
+    guid := Buffer(16, 0)
+    DllCall("Ole32\CLSIDFromString", "Str", guidStr, "Ptr", guid)
+    return guid
 }
 
 ; -----------------------------------------------------------------------------
