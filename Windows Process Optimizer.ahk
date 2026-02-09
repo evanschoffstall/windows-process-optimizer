@@ -84,7 +84,8 @@ global CONFIG := {
         "Flow.Launcher.exe",
         "explorer.exe",
         "everything.exe",
-        "yasb.exe"
+        "yasb.exe",
+        "AutoHotkey64.exe"
     ]
 }
 
@@ -186,6 +187,8 @@ currentScriptPID := DllCall("Kernel32\GetCurrentProcessId", "UInt")
 currentForegroundPID := 0
 foregroundHookHandle := 0
 pendingForegroundChange := false
+throttlingPaused := false
+throttlingLock := false
 
 ; =============================================================================
 ; INITIALIZATION
@@ -194,6 +197,7 @@ pendingForegroundChange := false
 ; Set up cleanup handler and start monitoring
 OnExit(RestoreAllProcesses)
 A_IconTip := "Windows Process Optimizer`nInitializing..."
+SetupTrayMenu()
 ScanAndApplyAll()
 SetupProcessWatcher()
 SetupForegroundWatcher()
@@ -208,7 +212,13 @@ SetTimer(ScanAndApplyAll, SCAN_INTERVAL_MS)
 ; Applies throttling to eligible processes based on configuration
 ; -----------------------------------------------------------------------------
 ScanAndApplyAll() {
-    global handled, currentScriptPID, CONFIG
+    global handled, currentScriptPID, CONFIG, throttlingPaused
+    if throttlingPaused {
+        UpdateTrayTooltip()
+        return
+    }
+    if !EnterThrottleSection()
+        return
     foregroundPID := CONFIG.skipForegroundProcess ? GetForegroundProcessId() : 0
     foregroundTreePIDs := BuildTreeMap(foregroundPID, CONFIG.skipForegroundProcessTree)
     exceptionTreePIDs := BuildExceptionTreeMap()
@@ -217,8 +227,10 @@ ScanAndApplyAll() {
     skipCounts := { uwp: 0, exception: 0, av: 0 }
 
     snapshot := DllCall("Kernel32\CreateToolhelp32Snapshot", "UInt", 0x2, "UInt", 0, "Ptr")
-    if (snapshot = -1)
+    if (snapshot = -1) {
+        ExitThrottleSection()
         return
+    }
 
     try {
         pe32 := Buffer(PROCESSENTRY32_SIZE, 0)
@@ -236,8 +248,89 @@ ScanAndApplyAll() {
         }
     } finally {
         DllCall("Kernel32\CloseHandle", "Ptr", snapshot)
+        ExitThrottleSection()
     }
     UpdateTrayTooltip(skipCounts.uwp, skipCounts.exception, skipCounts.av)
+}
+
+; -----------------------------------------------------------------------------
+; SetupTrayMenu - Configures tray icon context menu
+; -----------------------------------------------------------------------------
+SetupTrayMenu() {
+    tray := A_TrayMenu
+    tray.Delete()
+    tray.Add("Suspend Throttling", ToggleThrottling)
+    tray.Add()
+    tray.Add("Exit", (*) => ExitApp())
+    UpdateTrayMenuState()
+}
+
+; -----------------------------------------------------------------------------
+; EnterThrottleSection - Guards critical sections that mutate throttling state
+; Returns: true if lock acquired, false otherwise
+; -----------------------------------------------------------------------------
+EnterThrottleSection() {
+    global throttlingLock
+    if throttlingLock
+        return false
+    throttlingLock := true
+    Critical "On"
+    return true
+}
+
+; -----------------------------------------------------------------------------
+; ExitThrottleSection - Releases throttling critical section lock
+; -----------------------------------------------------------------------------
+ExitThrottleSection() {
+    global throttlingLock
+    Critical "Off"
+    throttlingLock := false
+}
+
+; -----------------------------------------------------------------------------
+; ToggleThrottling - Toggles throttling pause/resume from tray menu
+; -----------------------------------------------------------------------------
+ToggleThrottling(*) {
+    global throttlingPaused
+    throttlingPaused := !throttlingPaused
+    if throttlingPaused
+        PauseThrottling()
+    else
+        ResumeThrottling()
+    UpdateTrayMenuState()
+}
+
+; -----------------------------------------------------------------------------
+; PauseThrottling - Restores all handled processes and pauses future throttling
+; -----------------------------------------------------------------------------
+PauseThrottling() {
+    global handled
+    if !EnterThrottleSection()
+        return
+    for pid, info in handled.Clone() {
+        RestoreProcess(pid, info.priority, info.HasOwnProp("originalAffinity") ? info.originalAffinity : 0)
+    }
+    handled.Clear()
+    UpdateTrayTooltip()
+    ExitThrottleSection()
+}
+
+; -----------------------------------------------------------------------------
+; ResumeThrottling - Resumes throttling and re-scans processes
+; -----------------------------------------------------------------------------
+ResumeThrottling() {
+    ScanAndApplyAll()
+}
+
+; -----------------------------------------------------------------------------
+; UpdateTrayMenuState - Updates tray menu check state for pause toggle
+; -----------------------------------------------------------------------------
+UpdateTrayMenuState() {
+    global throttlingPaused
+    if throttlingPaused
+        A_TrayMenu.Check("Suspend Throttling")
+    else
+        A_TrayMenu.Uncheck("Suspend Throttling")
 }
 
 ; -----------------------------------------------------------------------------
@@ -429,7 +522,11 @@ ProcessBackgroundApp(pid) {
 ;   exceptionCount - Number of skipped exception processes
 ; -----------------------------------------------------------------------------
 UpdateTrayTooltip(uwpCount := 0, exceptionCount := 0, avCount := 0) {
-    global handled, CONFIG
+    global handled, CONFIG, throttlingPaused
+    if throttlingPaused {
+        A_IconTip := "Windows Process Optimizer`nPaused"
+        return
+    }
     foregroundPID := GetForegroundProcessId()
     if !foregroundPID {
         A_IconTip := "Windows Process Optimizer`nNo foreground window"
@@ -495,21 +592,31 @@ OnForegroundWindowChanged(hWinEventHook, event, hwnd, idObject, idChild, idEvent
 ; Restores new foreground process and throttles previous foreground process
 ; -----------------------------------------------------------------------------
 ProcessForegroundChange() {
-    global pendingForegroundChange, currentForegroundPID, handled, CONFIG
+    global pendingForegroundChange, currentForegroundPID, handled, CONFIG, throttlingPaused
     static lastProcessedPID := 0
     if !pendingForegroundChange
         return
     pendingForegroundChange := false
-    if (currentForegroundPID = lastProcessedPID)
+    if throttlingPaused {
+        UpdateTrayTooltip()
         return
-    newPID := currentForegroundPID
-    oldPID := lastProcessedPID
-    lastProcessedPID := newPID
-    if oldPID && oldPID != newPID
-        ApplyToProcessList(CONFIG.skipForegroundProcessTree ? GetProcessTreePIDs(oldPID) : [oldPID])
-    if newPID
-        RestoreProcessList(CONFIG.skipForegroundProcessTree ? GetProcessTreePIDs(newPID) : [newPID])
-    UpdateTrayTooltip()
+    }
+    if !EnterThrottleSection()
+        return
+    try {
+        if (currentForegroundPID = lastProcessedPID)
+            return
+        newPID := currentForegroundPID
+        oldPID := lastProcessedPID
+        lastProcessedPID := newPID
+        if oldPID && oldPID != newPID
+            ApplyToProcessList(CONFIG.skipForegroundProcessTree ? GetProcessTreePIDs(oldPID) : [oldPID])
+        if newPID
+            RestoreProcessList(CONFIG.skipForegroundProcessTree ? GetProcessTreePIDs(newPID) : [newPID])
+        UpdateTrayTooltip()
+    } finally {
+        ExitThrottleSection()
+    }
 }
 
 ; -----------------------------------------------------------------------------
@@ -518,37 +625,46 @@ ProcessForegroundChange() {
 ;   pidList - Array of process IDs to throttle
 ; -----------------------------------------------------------------------------
 ApplyToProcessList(pidList) {
-    global handled, currentScriptPID, CONFIG
-    audioPIDs := CONFIG.skipAvOutputProcesses ? GetActiveAudioSessionPids() : Map()
-    audioTreePIDs := BuildAvOutputTreeMap(audioPIDs, CONFIG.skipAvOutputProcessTree)
-    for _, targetPID in pidList {
-        if (targetPID = currentScriptPID || (CONFIG.skipWindowsApps && IsWindowsApp(targetPID)))
-            continue
-        if (CONFIG.mode = "blacklist" && !IsTargetApp(targetPID))
-            continue
-        if (CONFIG.mode = "whitelist" && IsException(targetPID))
-            continue
-        if (CONFIG.skipAvOutputProcesses && audioPIDs.Has(targetPID))
-            continue
-        if (CONFIG.skipAvOutputProcessTree && audioTreePIDs.Has(targetPID))
-            continue
-        if !handled.Has(targetPID) {
-            processName := GetProcessName(targetPID)
-            settings := GetProcessSettings(processName)
-
-            if !settings["enabled"]
+    global handled, currentScriptPID, CONFIG, throttlingPaused
+    if throttlingPaused
+        return
+    if !EnterThrottleSection()
+        return
+    try {
+        audioPIDs := CONFIG.skipAvOutputProcesses ? GetActiveAudioSessionPids() : Map()
+        audioTreePIDs := BuildAvOutputTreeMap(audioPIDs, CONFIG.skipAvOutputProcessTree)
+        for _, targetPID in pidList {
+            if (targetPID = currentScriptPID || (CONFIG.skipWindowsApps && IsWindowsApp(targetPID)))
                 continue
+            if (CONFIG.mode = "blacklist" && !IsTargetApp(targetPID))
+                continue
+            if (CONFIG.mode = "whitelist" && IsException(targetPID))
+                continue
+            if (CONFIG.skipAvOutputProcesses && audioPIDs.Has(targetPID))
+                continue
+            if (CONFIG.skipAvOutputProcessTree && audioTreePIDs.Has(targetPID))
+                continue
+            if !handled.Has(targetPID) {
+                processName := GetProcessName(targetPID)
+                settings := GetProcessSettings(processName)
 
-            originalPriority := GetProcessPriority(targetPID)
-            result := ApplyEfficiencyLikeMode(targetPID, settings)
-            if (originalPriority && result.success) {
-                memTrimmed := settings["useMemoryTrimming"] ? TrimProcessMemory(targetPID, settings["memoryThresholdMB"
-                    ],
-                    settings["useAggressiveMemory"], settings["memoryTrimPasses"]) : false
-                handled[targetPID] := { priority: originalPriority, throttled: true, memoryTrimmed: memTrimmed,
-                    originalAffinity: result.originalAffinity, processName: processName }
+                if !settings["enabled"]
+                    continue
+
+                originalPriority := GetProcessPriority(targetPID)
+                result := ApplyEfficiencyLikeMode(targetPID, settings)
+                if (originalPriority && result.success) {
+                    memTrimmed := settings["useMemoryTrimming"] ? TrimProcessMemory(targetPID, settings[
+                        "memoryThresholdMB"
+                        ],
+                        settings["useAggressiveMemory"], settings["memoryTrimPasses"]) : false
+                    handled[targetPID] := { priority: originalPriority, throttled: true, memoryTrimmed: memTrimmed,
+                        originalAffinity: result.originalAffinity, processName: processName }
+                }
             }
         }
+    } finally {
+        ExitThrottleSection()
     }
 }
 
@@ -567,9 +683,13 @@ RestoreProcessList(pidList) {
 ; Applies throttling to newly created processes if eligible
 ; -----------------------------------------------------------------------------
 OnProcessCreated_OnObjectReady(objWbemObject, objWbemAsyncContext) {
-    global currentScriptPID, CONFIG, handled
+    global currentScriptPID, CONFIG, handled, throttlingPaused
+    if !EnterThrottleSection()
+        return
     try {
         pid := objWbemObject.TargetInstance.ProcessId
+        if (throttlingPaused)
+            return
         if (pid = currentScriptPID || (CONFIG.skipWindowsApps && IsWindowsApp(pid)) || (CONFIG.skipForegroundProcess &&
             pid =
             GetForegroundProcessId()) || handled.Has(pid))
@@ -610,6 +730,8 @@ OnProcessCreated_OnObjectReady(objWbemObject, objWbemAsyncContext) {
             handled[pid] := { priority: originalPriority, throttled: true, memoryTrimmed: memTrimmed,
                 originalAffinity: result.originalAffinity, processName: processName }
         }
+    } finally {
+        ExitThrottleSection()
     }
 }
 
