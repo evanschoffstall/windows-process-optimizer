@@ -149,6 +149,7 @@ PROCESS_SET_INFORMATION := 0x0200
 PROCESS_SET_QUOTA := 0x0100
 PROCESS_VM_READ := 0x0010
 PROCESS_SUSPEND_RESUME := 0x0800
+PROCESS_TERMINATE := 0x0001
 
 ; Priority class constants
 IDLE_PRIORITY_CLASS := 0x0040
@@ -181,11 +182,13 @@ handled := Map()                ; Processes currently being throttled
 suspendCycleTimers := Map()     ; Active suspend cycle timers by PID
 cpuRateLimitTimers := Map()     ; Active CPU rate limit timers by PID
 cpuUsageTracking := Map()       ; CPU usage tracking data by PID
+processJobObjects := Map()      ; Job objects for CPU rate limiting by PID
 
 ; Runtime state
 currentScriptPID := DllCall("Kernel32\GetCurrentProcessId", "UInt")
 currentForegroundPID := 0
 foregroundHookHandle := 0
+foregroundHookCallback := 0
 pendingForegroundChange := false
 throttlingPaused := false
 throttlingLock := false
@@ -562,9 +565,10 @@ SetupProcessWatcher() {
 ; SetupForegroundWatcher - Sets up hook for foreground window change events
 ; -----------------------------------------------------------------------------
 SetupForegroundWatcher() {
-    global foregroundHookHandle, currentForegroundPID
-    callback := CallbackCreate(OnForegroundWindowChanged, "F", 7)
-    foregroundHookHandle := DllCall("User32\SetWinEventHook", "UInt", 0x0003, "UInt", 0x0003, "Ptr", 0, "Ptr", callback,
+    global foregroundHookHandle, foregroundHookCallback, currentForegroundPID
+    foregroundHookCallback := CallbackCreate(OnForegroundWindowChanged, "F", 7)
+    foregroundHookHandle := DllCall("User32\SetWinEventHook", "UInt", 0x0003, "UInt", 0x0003, "Ptr", 0, "Ptr",
+        foregroundHookCallback,
         "UInt", 0, "UInt", 0, "UInt", 0x0002, "Ptr")
     currentForegroundPID := GetForegroundProcessId()
 }
@@ -758,18 +762,27 @@ GetActiveAudioSessionPids() {
 
     iidAsm := GUIDFromString("{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}")
     asmPtr := 0
-    if (ComCall(3, device, "Ptr", iidAsm.Ptr, "UInt", CLSCTX_ALL, "Ptr", 0, "Ptr*", &asmPtr) != 0 || !asmPtr)
+    if (ComCall(3, device, "Ptr", iidAsm.Ptr, "UInt", CLSCTX_ALL, "Ptr", 0, "Ptr*", &asmPtr) != 0 || !asmPtr) {
+        ObjRelease(devicePtr)
         return pids
+    }
     asm := ComObjFromPtr(asmPtr)
 
     enumPtr := 0
-    if (ComCall(5, asm, "Ptr*", &enumPtr) != 0 || !enumPtr)
+    if (ComCall(5, asm, "Ptr*", &enumPtr) != 0 || !enumPtr) {
+        ObjRelease(asmPtr)
+        ObjRelease(devicePtr)
         return pids
+    }
     sessionEnum := ComObjFromPtr(enumPtr)
 
     count := 0
-    if (ComCall(3, sessionEnum, "UInt*", &count) != 0)
+    if (ComCall(3, sessionEnum, "UInt*", &count) != 0) {
+        ObjRelease(enumPtr)
+        ObjRelease(asmPtr)
+        ObjRelease(devicePtr)
         return pids
+    }
 
     loop count {
         index := A_Index - 1
@@ -777,27 +790,47 @@ GetActiveAudioSessionPids() {
         if (ComCall(4, sessionEnum, "UInt", index, "Ptr*", &sessionPtr) != 0 || !sessionPtr)
             continue
         session := ComObjFromPtr(sessionPtr)
+        session2Ptr := 0
         try {
             session2 := ComObjQuery(session, "{BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D}")
+            session2Ptr := ComObjValue(session2)
         } catch {
+            ObjRelease(sessionPtr)
             continue
         }
 
         state := 0
-        if (ComCall(3, session2, "UInt*", &state) != 0)
+        if (ComCall(3, session2, "UInt*", &state) != 0) {
+            ObjRelease(session2Ptr)
+            ObjRelease(sessionPtr)
             continue
-        if (state != 1)
+        }
+        if (state != 1) {
+            ObjRelease(session2Ptr)
+            ObjRelease(sessionPtr)
             continue
+        }
 
         isSystem := 0
         ComCall(15, session2, "Int*", &isSystem)
-        if (isSystem)
+        if (isSystem) {
+            ObjRelease(session2Ptr)
+            ObjRelease(sessionPtr)
             continue
+        }
 
         pid := 0
         if (ComCall(14, session2, "UInt*", &pid) = 0 && pid)
             pids[pid] := true
+
+        ObjRelease(session2Ptr)
+        ObjRelease(sessionPtr)
     }
+
+    ; Clean up COM objects
+    ObjRelease(enumPtr)
+    ObjRelease(asmPtr)
+    ObjRelease(devicePtr)
 
     return pids
 }
@@ -1038,12 +1071,19 @@ ArrayHas(arr, value) {
 ; Restores all throttled processes to their original state
 ; -----------------------------------------------------------------------------
 RestoreAllProcesses(*) {
-    global handled, foregroundHookHandle, suspendCycleTimers, cpuRateLimitTimers, cpuUsageTracking
+    global handled, foregroundHookHandle, foregroundHookCallback, suspendCycleTimers, cpuRateLimitTimers,
+        cpuUsageTracking, processJobObjects
 
     ; Stop foreground window hook
     if foregroundHookHandle {
         DllCall("User32\UnhookWinEvent", "Ptr", foregroundHookHandle)
         foregroundHookHandle := 0
+    }
+
+    ; Free callback function
+    if foregroundHookCallback {
+        CallbackFree(foregroundHookCallback)
+        foregroundHookCallback := 0
     }
 
     ; Stop all suspend cycle timers
@@ -1052,12 +1092,20 @@ RestoreAllProcesses(*) {
     }
     suspendCycleTimers.Clear()
 
-    ; Stop all CPU rate limit timers
+    ; Stop all CPU rate limit timers and close job objects
     for pid, timerFunc in cpuRateLimitTimers.Clone() {
         SetTimer(timerFunc, 0)
     }
     cpuRateLimitTimers.Clear()
     cpuUsageTracking.Clear()
+
+    ; Close all job objects
+    for pid, hJob in processJobObjects.Clone() {
+        if hJob {
+            DllCall("Kernel32\CloseHandle", "Ptr", hJob)
+        }
+    }
+    processJobObjects.Clear()
 
     ; Restore all handled processes
     for pid, info in handled {
@@ -1079,7 +1127,7 @@ RestoreProcess(pid, originalPriority, originalAffinity := 0) {
 
     ; Stop active throttling mechanisms (these also resume the process)
     StopSuspendCycle(pid)
-    StopCpuRateLimiter(pid)
+    CloseJobObjectForProcess(pid)
 
     ; Ensure process is fully resumed (resume multiple times for nested suspensions)
     hResume := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_SUSPEND_RESUME, "Int", false, "UInt", pid, "Ptr")
@@ -1251,9 +1299,9 @@ ApplyEfficiencyLikeMode(pid, settings) {
             DllCall("Kernel32\SetProcessWorkingSetSizeEx", "Ptr", hProc, "Ptr", minWS, "Ptr", maxWS, "UInt", 0x6)
         }
 
-        ; Start CPU rate limiting via active monitoring
+        ; Apply CPU rate limiting via Windows Job Object (lets Windows handle throttling)
         if settings["useCpuRateLimit"] {
-            StartCpuRateLimiter(pid, settings["cpuRateLimitPercent"])
+            CreateJobObjectForProcess(pid, settings["cpuRateLimitPercent"])
         }
         ; Start suspend/resume cycles
         if settings["useSuspendCycles"] {
@@ -1323,208 +1371,94 @@ StopSuspendCycle(pid) {
 }
 
 ; =============================================================================
-; CPU RATE LIMITER
-; Active monitoring with suspend/resume to enforce CPU usage limits
+; WINDOWS JOB OBJECT CPU RATE LIMITING
+; Uses native Windows scheduler for proper handoff throttling
 ; =============================================================================
 
 ; -----------------------------------------------------------------------------
-; StartCpuRateLimiter - Starts CPU rate limiting for a process
+; CreateJobObjectForProcess - Creates a job object with CPU rate limiting
+; Uses Windows' native CPU rate control for efficient throttling
 ; Parameters:
 ;   pid           - Process ID to limit
 ;   targetPercent - Maximum CPU usage percentage allowed
-; -----------------------------------------------------------------------------
-StartCpuRateLimiter(pid, targetPercent) {
-    global cpuRateLimitTimers, cpuUsageTracking, CPU_RATE_CHECK_INTERVAL
-
-    ; Initialize tracking state for this process
-    cpuUsageTracking[pid] := {
-        targetPercent: targetPercent,
-        lastKernelTime: 0,
-        lastUserTime: 0,
-        lastCheckTime: A_TickCount,
-        isSuspended: false,
-        suspendUntil: 0
-    }
-
-    ; Get initial CPU times and start monitoring timer
-    UpdateProcessCpuTimes(pid)
-    boundFunc := CpuRateLimitCallback.Bind(pid)
-    SetTimer(boundFunc, CPU_RATE_CHECK_INTERVAL)
-    cpuRateLimitTimers[pid] := boundFunc
-}
-
-; -----------------------------------------------------------------------------
-; StopCpuRateLimiter - Stops CPU rate limiting for a process
-; Parameters:
-;   pid - Process ID to stop limiting
-; -----------------------------------------------------------------------------
-StopCpuRateLimiter(pid) {
-    global cpuRateLimitTimers, cpuUsageTracking, PROCESS_SUSPEND_RESUME
-
-    ; Stop the monitoring timer
-    if cpuRateLimitTimers.Has(pid) {
-        SetTimer(cpuRateLimitTimers[pid], 0)
-        cpuRateLimitTimers.Delete(pid)
-    }
-
-    ; Clean up tracking and ensure process is resumed
-    if cpuUsageTracking.Has(pid) {
-        if cpuUsageTracking[pid].isSuspended {
-            hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_SUSPEND_RESUME, "Int", false, "UInt", pid, "Ptr")
-            if hProc {
-                DllCall("Ntdll\NtResumeProcess", "Ptr", hProc)
-                DllCall("Kernel32\CloseHandle", "Ptr", hProc)
-            }
-        }
-        cpuUsageTracking.Delete(pid)
-    }
-}
-
-; -----------------------------------------------------------------------------
-; UpdateProcessCpuTimes - Updates stored CPU time values for a process
-; Parameters:
-;   pid - Process ID to update
 ; Returns: true on success, false on failure
 ; -----------------------------------------------------------------------------
-UpdateProcessCpuTimes(pid) {
-    global cpuUsageTracking, PROCESS_QUERY_LIMITED_INFORMATION
+CreateJobObjectForProcess(pid, targetPercent) {
+    global processJobObjects, PROCESS_SET_QUOTA, PROCESS_TERMINATE
 
-    if !cpuUsageTracking.Has(pid)
+    ; Create anonymous job object
+    hJob := DllCall("Kernel32\CreateJobObject", "Ptr", 0, "Ptr", 0, "Ptr")
+    if !hJob
         return false
 
-    hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_QUERY_LIMITED_INFORMATION, "Int", false, "UInt", pid,
-        "Ptr")
-    if !hProc
+    ; Configure basic limits - DO NOT set KILL_ON_JOB_CLOSE as we want processes to survive
+    ; when our script exits or job is closed
+    basicLimit := Buffer(144, 0)  ; JOBOBJECT_BASIC_LIMIT_INFORMATION
+    NumPut("UInt", 0, basicLimit, 0)  ; Reserved1
+    NumPut("UInt", 0, basicLimit, 8)  ; LimitFlags = 0 (no flags, processes survive)
+
+    if !DllCall("Kernel32\SetInformationJobObject", "Ptr", hJob, "Int", 2, "Ptr", basicLimit.Ptr, "UInt", basicLimit.Size
+    ) {
+        DllCall("Kernel32\CloseHandle", "Ptr", hJob)
         return false
-
-    try {
-        creationTime := Buffer(8, 0)
-        exitTime := Buffer(8, 0)
-        kernelTime := Buffer(8, 0)
-        userTime := Buffer(8, 0)
-
-        if DllCall("Kernel32\GetProcessTimes", "Ptr", hProc, "Ptr", creationTime.Ptr, "Ptr", exitTime.Ptr, "Ptr",
-            kernelTime.Ptr, "Ptr", userTime.Ptr, "Int") {
-            cpuUsageTracking[pid].lastKernelTime := NumGet(kernelTime, 0, "Int64")
-            cpuUsageTracking[pid].lastUserTime := NumGet(userTime, 0, "Int64")
-            cpuUsageTracking[pid].lastCheckTime := A_TickCount
-            return true
-        }
-    } finally {
-        DllCall("Kernel32\CloseHandle", "Ptr", hProc)
     }
-    return false
+
+    ; Configure CPU rate control - uses Windows scheduler's hardware handoff
+    ; CpuRate value: 1-10000 representing 0.01% to 100%
+    ; JOBOBJECT_CPU_RATE_CONTROL_INFORMATION structure
+    cpuRateInfo := Buffer(16, 0)
+    cpuRate := Floor(targetPercent * 100)  ; Convert percent to 0.01% units
+    if cpuRate < 1
+        cpuRate := 1
+    if cpuRate > 10000
+        cpuRate := 10000
+
+    ; ControlFlags: 0x1 = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | 0x4 = JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP
+    NumPut("UInt", 0x5, cpuRateInfo, 0)  ; Enable with hard cap
+    NumPut("UInt", cpuRate, cpuRateInfo, 4)  ; CpuRate
+
+    if !DllCall("Kernel32\SetInformationJobObject", "Ptr", hJob, "Int", 9, "Ptr", cpuRateInfo.Ptr, "UInt", cpuRateInfo.Size
+    ) {
+        DllCall("Kernel32\CloseHandle", "Ptr", hJob)
+        return false
+    }
+
+    ; Assign process to job object
+    hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_SET_QUOTA | PROCESS_TERMINATE, "Int", false, "UInt", pid,
+        "Ptr")
+    if !hProc {
+        DllCall("Kernel32\CloseHandle", "Ptr", hJob)
+        return false
+    }
+
+    success := DllCall("Kernel32\AssignProcessToJobObject", "Ptr", hJob, "Ptr", hProc)
+    DllCall("Kernel32\CloseHandle", "Ptr", hProc)
+
+    if success {
+        ; Store job handle for cleanup
+        processJobObjects[pid] := hJob
+        return true
+    } else {
+        DllCall("Kernel32\CloseHandle", "Ptr", hJob)
+        return false
+    }
 }
 
 ; -----------------------------------------------------------------------------
-; GetProcessCpuPercent - Calculates current CPU usage percentage for a process
-; Uses delta between current and previous measurements
+; CloseJobObjectForProcess - Closes job object for a process
+; Process automatically leaves the job but continues running
 ; Parameters:
-;   pid - Process ID to measure
-; Returns: CPU usage percentage (0-100+)
+;   pid - Process ID
 ; -----------------------------------------------------------------------------
-GetProcessCpuPercent(pid) {
-    global cpuUsageTracking, PROCESS_QUERY_LIMITED_INFORMATION
+CloseJobObjectForProcess(pid) {
+    global processJobObjects
 
-    if !cpuUsageTracking.Has(pid)
-        return 0
-
-    tracking := cpuUsageTracking[pid]
-    prevKernel := tracking.lastKernelTime
-    prevUser := tracking.lastUserTime
-    prevTime := tracking.lastCheckTime
-
-    hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_QUERY_LIMITED_INFORMATION, "Int", false, "UInt", pid,
-        "Ptr")
-    if !hProc
-        return 0
-
-    try {
-        creationTime := Buffer(8, 0)
-        exitTime := Buffer(8, 0)
-        kernelTime := Buffer(8, 0)
-        userTime := Buffer(8, 0)
-
-        if DllCall("Kernel32\GetProcessTimes", "Ptr", hProc, "Ptr", creationTime.Ptr, "Ptr", exitTime.Ptr, "Ptr",
-            kernelTime.Ptr, "Ptr", userTime.Ptr, "Int") {
-            currentKernel := NumGet(kernelTime, 0, "Int64")
-            currentUser := NumGet(userTime, 0, "Int64")
-            currentTime := A_TickCount
-
-            ; Update stored values for next calculation
-            cpuUsageTracking[pid].lastKernelTime := currentKernel
-            cpuUsageTracking[pid].lastUserTime := currentUser
-            cpuUsageTracking[pid].lastCheckTime := currentTime
-
-            ; Calculate elapsed time and CPU time delta (times are in 100ns intervals)
-            elapsedMs := currentTime - prevTime
-            if elapsedMs <= 0
-                return 0
-
-            cpuTimeDelta := (currentKernel - prevKernel) + (currentUser - prevUser)
-            cpuTimeMs := cpuTimeDelta / 10000
-
-            ; Get processor count for accurate percentage calculation
-            numProcessors := DllCall("Kernel32\GetActiveProcessorCount", "UShort", 0xFFFF, "UInt")
-            if numProcessors < 1
-                numProcessors := 1
-
-            ; Calculate percentage: (CPU time / wall time / processors) * 100
-            cpuPercent := (cpuTimeMs / elapsedMs / numProcessors) * 100
-            return cpuPercent
-        }
-    } finally {
-        DllCall("Kernel32\CloseHandle", "Ptr", hProc)
-    }
-    return 0
-}
-
-; -----------------------------------------------------------------------------
-; CpuRateLimitCallback - Timer callback for CPU rate limit enforcement
-; Monitors CPU usage and suspends process when over limit
-; Parameters:
-;   pid - Process ID to monitor
-; -----------------------------------------------------------------------------
-CpuRateLimitCallback(pid) {
-    global cpuUsageTracking, handled, PROCESS_SUSPEND_RESUME
-
-    ; Verify process is still being managed
-    if !handled.Has(pid) || !cpuUsageTracking.Has(pid) {
-        StopCpuRateLimiter(pid)
+    if !processJobObjects.Has(pid)
         return
+
+    hJob := processJobObjects[pid]
+    if hJob {
+        DllCall("Kernel32\CloseHandle", "Ptr", hJob)
     }
-
-    tracking := cpuUsageTracking[pid]
-
-    ; Check if suspended process should be resumed
-    if tracking.isSuspended {
-        if A_TickCount >= tracking.suspendUntil {
-            hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_SUSPEND_RESUME, "Int", false, "UInt", pid, "Ptr")
-            if hProc {
-                DllCall("Ntdll\NtResumeProcess", "Ptr", hProc)
-                DllCall("Kernel32\CloseHandle", "Ptr", hProc)
-            }
-            cpuUsageTracking[pid].isSuspended := false
-            UpdateProcessCpuTimes(pid)
-        }
-        return
-    }
-
-    ; Check CPU usage and suspend if over limit
-    cpuPercent := GetProcessCpuPercent(pid)
-
-    if cpuPercent > tracking.targetPercent {
-        hProc := DllCall("Kernel32\OpenProcess", "UInt", PROCESS_SUSPEND_RESUME, "Int", false, "UInt", pid, "Ptr")
-        if hProc {
-            DllCall("Ntdll\NtSuspendProcess", "Ptr", hProc)
-            DllCall("Kernel32\CloseHandle", "Ptr", hProc)
-
-            ; Calculate suspension duration based on overage (50-500ms)
-            overageRatio := cpuPercent / Max(tracking.targetPercent, 1)
-            suspendMs := Min(Max(50 * overageRatio, 50), 500)
-
-            cpuUsageTracking[pid].isSuspended := true
-            cpuUsageTracking[pid].suspendUntil := A_TickCount + suspendMs
-        }
-    }
+    processJobObjects.Delete(pid)
 }
