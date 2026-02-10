@@ -53,8 +53,7 @@ global CONFIG := {
     targets: [
         "Taskmgr.exe",
         "bdservicehost.exe",
-        "downloader.exe",
-        "testinitsigs.exe", {
+        "downloader.exe", {
             names: ["svchost.exe", "AdobeColabSync.exe", "WmiPrvSE.exe", "CCleaner_service.exe"],
             enabled: true,
             useIdlePriority: true,
@@ -169,7 +168,6 @@ PBI_PARENT_OFFSET_X64 := 40
 
 ; Timing constants
 SCAN_INTERVAL_MS := 15000
-CPU_RATE_CHECK_INTERVAL := 100
 
 ; COM activation constants
 CLSCTX_ALL := 0x17
@@ -180,8 +178,6 @@ MAX_PATH_CHARS := 260
 ; State tracking maps
 handled := Map()                ; Processes currently being throttled
 suspendCycleTimers := Map()     ; Active suspend cycle timers by PID
-cpuRateLimitTimers := Map()     ; Active CPU rate limit timers by PID
-cpuUsageTracking := Map()       ; CPU usage tracking data by PID
 processJobObjects := Map()      ; Job objects for CPU rate limiting by PID
 
 ; Runtime state
@@ -1071,8 +1067,7 @@ ArrayHas(arr, value) {
 ; Restores all throttled processes to their original state
 ; -----------------------------------------------------------------------------
 RestoreAllProcesses(*) {
-    global handled, foregroundHookHandle, foregroundHookCallback, suspendCycleTimers, cpuRateLimitTimers,
-        cpuUsageTracking, processJobObjects
+    global handled, foregroundHookHandle, foregroundHookCallback, suspendCycleTimers, processJobObjects
 
     ; Stop foreground window hook
     if foregroundHookHandle {
@@ -1091,13 +1086,6 @@ RestoreAllProcesses(*) {
         SetTimer(timerFunc, 0)
     }
     suspendCycleTimers.Clear()
-
-    ; Stop all CPU rate limit timers and close job objects
-    for pid, timerFunc in cpuRateLimitTimers.Clone() {
-        SetTimer(timerFunc, 0)
-    }
-    cpuRateLimitTimers.Clear()
-    cpuUsageTracking.Clear()
 
     ; Close all job objects
     for pid, hJob in processJobObjects.Clone() {
@@ -1254,6 +1242,7 @@ ApplyEfficiencyLikeMode(pid, settings) {
         return { success: false, originalAffinity: 0 }
     originalAffinity := 0
     try {
+        ok := true
         if settings["useBackgroundMode"]
             DllCall("Kernel32\SetPriorityClass", "Ptr", hProc, "UInt", PROCESS_MODE_BACKGROUND_BEGIN)
         else {
@@ -1262,14 +1251,8 @@ ApplyEfficiencyLikeMode(pid, settings) {
         }
         ppt := Buffer(12, 0)
         NumPut("UInt", 1, ppt, 0), NumPut("UInt", 0x3, ppt, 4), NumPut("UInt", 0x3, ppt, 8)
-        ok := DllCall("Kernel32\SetProcessInformation", "Ptr", hProc, "Int", 4, "Ptr", ppt.Ptr, "UInt", ppt.Size, "Int"
+        DllCall("Kernel32\SetProcessInformation", "Ptr", hProc, "Int", 4, "Ptr", ppt.Ptr, "UInt", ppt.Size, "Int"
         )
-        if ok {
-            ecoQoS := Buffer(12, 0)
-            NumPut("UInt", 1, ecoQoS, 0), NumPut("UInt", 0x3, ecoQoS, 4), NumPut("UInt", 0x3, ecoQoS, 8)
-            DllCall("Kernel32\SetProcessInformation", "Ptr", hProc, "Int", 4, "Ptr", ecoQoS.Ptr, "UInt", ecoQoS.Size,
-                "Int")
-        }
         if settings["useIoPriority"] {
             ioPriority := Buffer(4, 0)
             NumPut("UInt", 0, ioPriority, 0)
